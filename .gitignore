@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+# Node
+node_modules/
+# Environment and secrets
+.env
+.env*
+*.pem
+*.key
+# Local data and run output
+backend/.run/
+*.log
+*.sqlite
+*.dump
+.DS_Store
