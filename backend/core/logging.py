@@ -104,3 +104,27 @@ def log_event(event: str, level: int = _std.INFO, **fields: Any) -> None:
     _std.getLogger(_LOGGER_NAME).log(
         level, event, extra={"mr_fields": safe, "mr_correlation_id": get_correlation_id()}
     )
+
+
+class _NoServerText(_std.Filter):
+    """Server loggers (uvicorn) keep only the event that something failed: no message arguments, no
+    exception text or traceback, which could carry provider error text or content (B1-006)."""
+
+    def filter(self, record: _std.LogRecord) -> bool:
+        if record.exc_info or record.args or record.levelno >= _std.WARNING:
+            record.msg = f"server event suppressed ({record.levelname.lower()}; details withheld)"
+            record.args = None
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
+        return True
+
+
+def quiet_server_loggers() -> None:
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "fastapi", "starlette"):
+        logger = _std.getLogger(name)
+        if not any(isinstance(f, _NoServerText) for f in logger.filters):
+            logger.addFilter(_NoServerText())
+        for handler in logger.handlers:
+            if not any(isinstance(f, _NoServerText) for f in handler.filters):
+                handler.addFilter(_NoServerText())

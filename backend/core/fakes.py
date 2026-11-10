@@ -40,6 +40,8 @@ class OutboundCall:
     identifier: str
     endpoint: str
     stream: bool
+    model: str | None = None
+    body_keys: tuple[str, ...] = ()
 
 
 class FakeInference:
@@ -56,7 +58,9 @@ class FakeInference:
         d = request.decision
         if not d.is_sealed():
             raise AssertionError("unsealed decision reached the provider stub")
-        self.calls.append(OutboundCall(d.provider, d.upstream_host, d.upstream_identifier, request.endpoint, stream))
+        model = request.body.get("model")
+        self.calls.append(OutboundCall(d.provider, d.upstream_host, d.upstream_identifier, request.endpoint, stream,
+                                       model if isinstance(model, str) else None, tuple(sorted(request.body))))
 
     def send(self, request: UpstreamRequest) -> UpstreamResponse:
         self._record(request, stream=False)

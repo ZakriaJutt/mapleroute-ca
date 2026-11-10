@@ -41,7 +41,7 @@ def main(argv: list[str] | None = None) -> int:
     db_bootstrap.main(["migrate", "--database", "mapleroute_dev"])
     env = {
         **os.environ,
-        "MAPLEROUTE_DATABASE_URL": "postgresql+psycopg://mapleroute_app@localhost:5432/mapleroute_dev",
+        "MAPLEROUTE_DATABASE": "mapleroute_dev",
         "MAPLEROUTE_PROVIDER_MODE": "fake",
         "MAPLEROUTE_FAKE_KMS_KEY_HEX": os.environ.get("MAPLEROUTE_FAKE_KMS_KEY_HEX", secrets.token_hex(32)),
     }

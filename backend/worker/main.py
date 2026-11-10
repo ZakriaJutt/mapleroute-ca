@@ -60,7 +60,7 @@ def tick(factory: sessionmaker[Session], services: WorkerServices, max_jobs: int
 
 def check() -> int:
     loaded = [m for m in WEB_MODULES if m in sys.modules]
-    with session_factory()() as s:
+    with session_factory(settings().worker_database_url)() as s:
         s.execute(text("SELECT 1"))
     log_event("worker_ready", process="worker", constants_hash=constants_hash(), status="ok" if not loaded else "web")
     return 0 if not loaded else 1
@@ -77,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.check:
         return check()
     services = WorkerServices(FakeAwsReader(), FakeAzureReader(), local_key_service())
-    factory = session_factory()
+    factory = session_factory(settings().worker_database_url)
     log_event("worker_start", process="worker", constants_hash=constants_hash())
     while True:
         tick(factory, services)

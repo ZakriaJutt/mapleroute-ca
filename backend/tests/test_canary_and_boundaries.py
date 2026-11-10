@@ -98,7 +98,7 @@ def test_it18_worker_starts_without_web_modules_and_hashes_agree() -> None:
                                   check=True).stdout.strip())
     assert len(hashes) == 1
     env_check = subprocess.run([PY, "-m", "worker.main", "--check"], cwd=BACKEND, capture_output=True, text=True,
-                               env={"MAPLEROUTE_DATABASE_URL": OWNER_URL.replace("zakria", "mapleroute_app"),
+                               env={"MAPLEROUTE_DATABASE": "mapleroute_test",
                                     "PATH": "/usr/bin:/bin"})
     assert env_check.returncode == 0, env_check.stderr[-500:]
     assert '"event": "worker_ready"' in env_check.stdout

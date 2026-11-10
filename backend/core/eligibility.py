@@ -7,6 +7,9 @@ the decision can be replayed (MH-02). Anything not listed is denied; there is no
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import secrets
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -41,6 +44,15 @@ class BindingState:
     endpoint_host: str | None
 
 
+_MAC_KEY = secrets.token_bytes(32)  # per process; a Decision never crosses a process boundary
+
+
+def _mac(d: Decision) -> bytes:
+    fields = (d.binding_id, d.connection_id, d.route_id, d.provider, d.source_region, d.upstream_host,
+              d.upstream_identifier, d.allowlist_version, d.route_status, d.binding_verified_at.isoformat())
+    return hmac.new(_MAC_KEY, repr(fields).encode(), hashlib.sha256).digest()
+
+
 @dataclass(frozen=True)
 class Decision:
     binding_id: uuid.UUID
@@ -56,11 +68,14 @@ class Decision:
     _seal: object = field(repr=False, compare=False, default=None)
 
     def __post_init__(self) -> None:
-        if self._seal is not _SEAL:
-            raise TypeError("a Decision is built only by core.eligibility.evaluate")
+        # Only the evaluator passes the capability; it is exchanged for a MAC over every field, so a
+        # copy made with dataclasses.replace (or any other change of a field) is no longer sealed
+        # (B1-007). Anything else constructs an unsealed object that forward() refuses.
+        if self._seal is _SEAL:
+            object.__setattr__(self, "_seal", _mac(self))
 
     def is_sealed(self) -> bool:
-        return self._seal is _SEAL
+        return isinstance(self._seal, bytes) and hmac.compare_digest(self._seal, _mac(self))
 
 
 @dataclass(frozen=True)

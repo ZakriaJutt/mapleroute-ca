@@ -23,7 +23,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
-from core import clock, keys, policy_store, requestlog, tenancy
+from core import clock, keys, locks, policy_store, requestlog, tenancy
 from core.allowlist import RouteKey
 from core.config import ALIAS_MAX_LEN, UNSUPPORTED_PARAMETERS, constants_hash
 from core.crypto import KeyService, decrypt_secret
@@ -34,6 +34,40 @@ from core.models import ApiKey, Binding, ConnectionSecret, ProviderConnection, R
 from core.providers import AwsSessionProvider, InferenceClient, UpstreamError, UpstreamTimeout
 from core.secretvalue import SecretValue
 from gateway.forward import forward, forward_stream
+
+
+class NoExceptionText:
+    """Outermost-but-one ASGI layer: any exception that escapes a handler becomes a generic 500 and
+    is logged by class only. Starlette's ServerErrorMiddleware would re-raise it to the server,
+    which logs the exception text (B1-006)."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = False
+
+        async def tracking_send(message: Any) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, tracking_send)
+        except Exception as exc:  # noqa: BLE001 - never let exception text reach the server log
+            log_event("unhandled_exception", error_class=type(exc).__name__, http_status=500)
+            if started:
+                return
+            body = json.dumps({"error": {"type": "server_error", "code": None, "message": "Internal error.",
+                                         "param": None, "request_id": None, "allowlist_version": None,
+                                         "forwarded": None}}).encode()
+            await send({"type": "http.response.start", "status": 500,
+                        "headers": [(b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": body})
 
 
 class RateLimiter:
@@ -131,6 +165,7 @@ def _unsupported(body: dict[str, Any]) -> str | None:
 
 def create_app(services: GatewayServices) -> FastAPI:
     app = FastAPI(title="MapleRoute gateway", docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_middleware(NoExceptionText)
 
     def authenticate(request: Request) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID] | Code:
         token = _bearer(request)
@@ -176,6 +211,9 @@ def create_app(services: GatewayServices) -> FastAPI:
             pre: tuple[Code, str | None] | None = None
             if not isinstance(parsed, dict):
                 pre = (Code.UNSUPPORTED_PARAMETER, None)
+            elif isinstance(model, str) and len(model) > ALIAS_MAX_LEN:
+                # Never serve a truncated alias on another binding (B1-008); the row keeps the prefix.
+                pre = (Code.ROUTE_NOT_ELIGIBLE, "model")
             elif (param := _unsupported(body)) is not None:
                 pre = (Code.UNSUPPORTED_PARAMETER, param)
             elif not services.limiter.allow(key_id, ctx.received_at):
@@ -188,6 +226,10 @@ def create_app(services: GatewayServices) -> FastAPI:
                     tenancy.set_tenant(s, tenant_id)
                     version = policy_store.load_active(s)
                     ctx.allowlist_version = version.version if version else None
+                    if not pre:
+                        # Shared binding lock: a mismatch being applied for this binding finishes first
+                        # (B1-001); every row committed here is visible to its window flagging.
+                        locks.binding_lock(s, project_id, ctx.alias, shared=True)
                     found = None if pre else _load_binding_state(s, project_id, ctx.alias)
                     if pre:
                         outcome = Rejection(pre[0], allowlist_version=ctx.allowlist_version)
@@ -251,6 +293,9 @@ def create_app(services: GatewayServices) -> FastAPI:
                     upstream_ms=int((time.monotonic() - started) * 1000))
             return _upstream_reject(ctx, d, Code.UPSTREAM_ERROR, provider_status=err.status,
                                     provider_code=err.provider_code)
+        except Exception as exc:  # noqa: BLE001 - adapter failure: class only, never its text (B1-006)
+            _adapter_failed(ctx, exc)
+            return _upstream_reject(ctx, d, Code.UPSTREAM_ERROR)
         payload = json.dumps(resp.body).encode()
         elapsed = int((time.monotonic() - started) * 1000)
         _finish(ctx, "completed", http_status=200, input_tokens=resp.input_tokens,
@@ -267,6 +312,11 @@ def create_app(services: GatewayServices) -> FastAPI:
                           alias=ctx.alias or None, **extra)
         return JSONResponse(body, status_code=CONTRACT[code].http_status, headers=_headers(ctx, d.route_id))
 
+    def _adapter_failed(ctx: _Ctx, exc: BaseException) -> None:
+        log_event("adapter_failed", request_id=ctx.request_id, error_class=type(exc).__name__,
+                  code=Code.UPSTREAM_ERROR.value)
+        _finish(ctx, "upstream_error", code=Code.UPSTREAM_ERROR.value, http_status=502)
+
     def _stream(ctx: _Ctx, d: Decision, body: dict[str, Any], credential: SecretValue) -> Response:
         try:
             upstream = forward_stream(services.clients, d, body, credential)
@@ -278,6 +328,9 @@ def create_app(services: GatewayServices) -> FastAPI:
             _finish(ctx, "upstream_error", code=Code.UPSTREAM_ERROR.value, http_status=502)
             return _upstream_reject(ctx, d, Code.UPSTREAM_ERROR, provider_status=err.status,
                                     provider_code=err.provider_code)
+        except Exception as exc:  # noqa: BLE001 - adapter failure: class only, never its text (B1-006)
+            _adapter_failed(ctx, exc)
+            return _upstream_reject(ctx, d, Code.UPSTREAM_ERROR)
         return StreamingResponse(
             relay(ctx, first, upstream), media_type="text/event-stream", headers=_headers(ctx, d.route_id)
         )
@@ -298,6 +351,9 @@ def create_app(services: GatewayServices) -> FastAPI:
             raise
         except (UpstreamError, UpstreamTimeout):
             state, code = "upstream_error", Code.UPSTREAM_ERROR.value
+        except Exception as exc:  # noqa: BLE001 - mid-stream adapter failure: end the stream, log class only
+            state, code = "upstream_error", Code.UPSTREAM_ERROR.value
+            log_event("adapter_failed", request_id=ctx.request_id, error_class=type(exc).__name__)
         finally:
             _finish(ctx, state, code=code, http_status=200, response_bytes=sent)
 

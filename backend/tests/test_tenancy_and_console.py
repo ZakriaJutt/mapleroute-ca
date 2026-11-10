@@ -45,24 +45,32 @@ def test_it08_no_tenant_context_reads_zero_rows(world: World) -> None:
     with world.owner() as s:
         populated = {t: s.execute(text(f"SELECT count(*) FROM {t}")).scalar_one() for t in TENANT_TABLES}
     assert sum(populated.values()) > 0
-    with world.app() as s:
-        assert tenancy.current_tenant(s) is None
-        for table in TENANT_TABLES:
-            assert s.execute(text(f"SELECT count(*) FROM {table}")).scalar_one() == 0, table
-    with world.app() as s:
-        role = s.execute(text("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user")).one()
-        assert tuple(role) == (False, False)
+    checked = 0
+    for factory in (world.gw, world.con, world.app, world.ops):
+        with factory() as s:
+            assert tenancy.current_tenant(s) is None
+            role = s.execute(text("SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user")).one()
+            assert tuple(role) == (False, False)
+            for table in TENANT_TABLES:
+                if not s.execute(text("SELECT has_table_privilege(current_user, :t, 'SELECT')"),
+                                 {"t": table}).scalar_one():
+                    continue
+                assert s.execute(text(f"SELECT count(*) FROM {table}")).scalar_one() == 0, table
+                checked += 1
+    assert checked >= 15
 
 
 def test_it08_job_for_a_reads_zero_rows_of_b(world: World) -> None:
     a, b = two_tenants(world)
-    with world.app() as s, s.begin():
+    with world.app() as s, s.begin():  # worker role, as a job for B
         tenancy.set_tenant(s, b.tenant_id)
         assert s.execute(select(RequestLog)).scalars().all() == []
         assert s.execute(select(Binding)).scalars().all() == []
-        assert s.get(Project, a.project_id) is None
         tenancy.set_tenant(s, a.tenant_id)
         assert len(s.execute(select(RequestLog)).scalars().all()) == 1
+    with world.con() as s, s.begin():
+        tenancy.set_tenant(s, b.tenant_id)
+        assert s.get(Project, a.project_id) is None
 
 
 def test_it08_b_session_and_key_on_a_ids_get_404(world: World) -> None:
@@ -76,10 +84,12 @@ def test_it08_b_session_and_key_on_a_ids_get_404(world: World) -> None:
     r = world.chat(world.gateway(), b.key, "haiku")
     assert r.status_code == 403 and r.json()["error"]["code"] == "route_not_eligible"
     # A cross-tenant write is refused by the policy's WITH CHECK.
-    with world.app() as s, s.begin():
+    with world.con() as s, s.begin():
         tenancy.set_tenant(s, b.tenant_id)
         try:
-            s.add(Project(tenant_id=a.tenant_id, name="smuggled"))
+            s.add(ProviderConnection(tenant_id=a.tenant_id, project_id=a.project_id, provider="aws",
+                                     account_ref="smuggled", source_region="ca-central-1", role_arn="arn:x",
+                                     external_id="x"))
             s.flush()
             raise AssertionError("cross-tenant insert succeeded")
         except Exception as exc:  # noqa: BLE001
@@ -185,7 +195,7 @@ def test_route_removal_in_use_waits_seven_days(world: World) -> None:
 def test_it09_sweeper_then_late_completion_reconciles(world: World) -> None:
     a, _ = two_tenants(world)
     rid, at = uuid.uuid4(), world.clock()
-    with world.app.begin() as s:
+    with world.gw.begin() as s:
         tenancy.set_tenant(s, a.tenant_id)
         requestlog.insert(s, requestlog.NewRow(rid, a.tenant_id, a.project_id, a.key_id, at, "chat", "haiku",
                                                "forwarding", route_id=HAIKU, allowlist_version="2026.11.10-1",
@@ -193,7 +203,7 @@ def test_it09_sweeper_then_late_completion_reconciles(world: World) -> None:
     world.clock.advance(minutes=16)
     with world.app.begin() as s:
         assert sweep_outcomes(s, world.clock()) == 1
-    with world.app.begin() as s:
+    with world.gw.begin() as s:
         tenancy.set_tenant(s, a.tenant_id)
         assert requestlog.transition(s, rid, at, "completed", world.clock(), http_status=200)
         assert not requestlog.transition(s, rid, at, "completed", world.clock())  # second writer: no change

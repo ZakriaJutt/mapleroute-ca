@@ -124,13 +124,13 @@ def test_ut03_db_altered_document_rejects_requests(world: World) -> None:
 def test_versions_are_immutable_and_republish_is_idempotent(world: World) -> None:
     world.activate()
     op = world.operator()
-    with world.app.begin() as s:
+    with world.ops.begin() as s:
         again = policy_store.publish_draft(s, "2026.11.10-1", fixture_routes(), op)
     assert again.created is False
     changed = [dict(r) for r in fixture_routes()[:-1]]
-    with pytest.raises(policy_store.VersionConflict), world.app.begin() as s:
+    with pytest.raises(policy_store.VersionConflict), world.ops.begin() as s:
         policy_store.publish_draft(s, "2026.11.10-1", changed, op)
-    with pytest.raises(Exception, match="immutable"), world.app.begin() as s:
+    with pytest.raises(Exception, match="immutable"), world.owner.begin() as s:
         s.execute(text("UPDATE allowlist_version SET document = '{}'::jsonb"))
     with pytest.raises(Exception, match="never deleted"), world.owner.begin() as s:
         s.execute(text("DELETE FROM allowlist_version"))
@@ -140,7 +140,7 @@ def test_at_most_one_active_version(world: World) -> None:
     world.activate()
     routes = [r for r in fixture_routes() if r["provider"] == "aws"]
     world.activate(routes, version="2026.11.11-1")
-    with world.app.begin() as s:
+    with world.ops.begin() as s:
         states = {r[0]: r[1] for r in s.execute(text("SELECT version, state FROM allowlist_version"))}
         active = policy_store.load_active(s)
     assert states == {"2026.11.10-1": "superseded", "2026.11.11-1": "active"}

@@ -219,12 +219,12 @@ def test_it04_log_insert_failure_rejects_audit_unavailable(world: World) -> None
     t, _ = verified_world(world)
     world.inference.calls.clear()
     with world.owner.begin() as s:
-        s.execute(text("REVOKE INSERT ON request_log FROM mapleroute_app"))
+        s.execute(text("REVOKE INSERT ON request_log FROM mapleroute_gateway"))
     try:
         r = world.chat(world.gateway(), t.key, "haiku")
     finally:
         with world.owner.begin() as s:
-            s.execute(text("GRANT INSERT ON request_log TO mapleroute_app"))
+            s.execute(text("GRANT INSERT ON request_log TO mapleroute_gateway"))
     assert r.status_code == 503 and r.json()["error"]["code"] == "audit_unavailable"
     assert world.inference.calls == []
     assert rows(world) == []

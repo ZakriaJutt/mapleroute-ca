@@ -130,12 +130,12 @@ def test_it10_suspension_alerts_every_bound_tenant_once(world: World) -> None:
 def test_it05d_resume_refused_until_a_newer_match_exists(world: World) -> None:
     a, b, ba, bb = suspended_world(world)
     op = world.operator()
-    with pytest.raises(Exception, match="cannot resume"), world.app.begin() as s:
+    with pytest.raises(Exception, match="cannot resume"), world.ops.begin() as s:
         resume_route(s, HAIKU, op, world.clock())
     assert route(world, HAIKU).global_status == "suspended"
     world.clock.advance(minutes=30)
     assert world.verify(b, bb).result == "match"  # a newer match from an account that reads correctly
-    with world.app.begin() as s:
+    with world.ops.begin() as s:
         resume_route(s, HAIKU, op, world.clock())
     assert route(world, HAIKU).global_status == "active"
 
@@ -158,7 +158,7 @@ def test_ut06_late_match_after_mismatch_leaves_route_suspended(world: World) -> 
     assert applied.applied is False
     assert route(world, HAIKU).global_status == "suspended"
     assert binding(world, ba).last_checked_at == world.clock.t.replace(hour=10, minute=0)
-    with pytest.raises(Exception, match="cannot resume"), world.app.begin() as s:
+    with pytest.raises(Exception, match="cannot resume"), world.ops.begin() as s:
         resume_route(s, HAIKU, world.operator(), world.clock())
 
 

@@ -8,8 +8,12 @@ One outcome per kind of mismatch (TRD.md, AD-14):
   differs. The route's global status becomes ``suspended`` for every tenant.
 - ``access_failed`` / ``error``: nothing usable. No status change; the binding ages out. Never a pass.
 
-A result is applied only if its ``checked_at`` is later than the stored one (R-01). A binding is
-``verified`` only when L2 (the customer-side deny policy) was read in place at that same check.
+Ordering (R-01, B1-001, B1-003): ``checked_at`` is taken when the provider reads end, and the result
+is decided under the binding lock. A ``match`` is applied only if it is newer than the stored check,
+so a late match can never re-verify anything. A mismatch is always applied: un-verifying or
+suspending is never unsafe. The window flagged on a mismatch starts at the start of the reads of the
+last matching check and has no upper bound. A binding is ``verified`` only when L2 (the
+customer-side deny policy) was read in place at that same check.
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session
 
 from core import alerts, jobs
@@ -168,13 +172,20 @@ class Applied:
 
 
 def apply_outcome(session: Session, binding: Binding, outcome: CheckOutcome, checked_at: datetime,
-                  allowlist_version: str, pager: alerts.Pager) -> Applied:
-    """Record the verification row and apply its effect. Caller holds the tenant context and the
-    binding row lock (SELECT ... FOR UPDATE)."""
+                  allowlist_version: str, pager: alerts.Pager,
+                  reads_started_at: datetime | None = None) -> Applied:
+    """Record the verification row and apply its effect. Caller holds the tenant context, the
+    binding advisory lock and the binding row lock (SELECT ... FOR UPDATE).
+
+    ``reads_started_at``..``checked_at`` is the interval in which the provider was read.
+    """
+    started = reads_started_at or checked_at
+    answer = {**outcome.provider_answer,
+              "coverage": {"reads_started_at": started.isoformat(), "reads_ended_at": checked_at.isoformat()}}
     session.add(
         Verification(
             tenant_id=binding.tenant_id, binding_id=binding.id, route_id=binding.route_id, checked_at=checked_at,
-            result=outcome.result, reason=outcome.reason, provider_answer=outcome.provider_answer,
+            result=outcome.result, reason=outcome.reason, provider_answer=answer,
             allowlist_version=allowlist_version, grade=outcome.grade,
         )
     )
@@ -187,14 +198,18 @@ def apply_outcome(session: Session, binding: Binding, outcome: CheckOutcome, che
             )
         )
     session.flush()
-    if binding.last_checked_at is not None and checked_at <= binding.last_checked_at:
-        return Applied(outcome.result, applied=False)  # late result: recorded, never applied (R-01)
-    binding.last_checked_at = checked_at
+    newer = binding.last_checked_at is None or checked_at > binding.last_checked_at
+    if newer:
+        binding.last_checked_at = checked_at
     connection = session.get(ProviderConnection, binding.connection_id)
     if outcome.result == "match":
+        if not newer:
+            session.flush()
+            return Applied("match", applied=False)  # late match: recorded, never applied (R-01)
         binding.status = "verified"
-        binding.last_verified_at = checked_at
-        binding.l2_confirmed_at = checked_at
+        # Validity and the next window start from the start of the reads (conservative).
+        binding.last_verified_at = started
+        binding.l2_confirmed_at = started
         binding.provider_modified_at = outcome.provider_modified_at
         if connection is not None and connection.state != "deleted":
             connection.state, connection.last_read_ok_at = "connected", checked_at
@@ -202,11 +217,11 @@ def apply_outcome(session: Session, binding: Binding, outcome: CheckOutcome, che
         return Applied("match", True)
     if outcome.result == "config_mismatch":
         since = binding.last_verified_at
-        binding.status = "unverified"
-        if outcome.provider_modified_at is not None:
+        binding.status = "unverified"  # always: a mismatch is never discarded as late (B1-003)
+        if newer and outcome.provider_modified_at is not None:
             binding.provider_modified_at = outcome.provider_modified_at  # new baseline for the next check
         session.flush()
-        flagged = flag_window(session, binding, since, checked_at) if since is not None else 0
+        flagged = flag_window(session, binding, since) if since is not None else 0
         raised = alerts.raise_alert(
             session, binding.tenant_id, "config_mismatch", f"config_mismatch:{binding.id}:{since}",
             {"binding_id": str(binding.id), "route_id": binding.route_id, "reason": outcome.reason,
@@ -246,28 +261,32 @@ def apply_outcome(session: Session, binding: Binding, outcome: CheckOutcome, che
     return Applied(outcome.result, True, alert_raised=raised)
 
 
-def flag_window(session: Session, binding: Binding, since: datetime, until: datetime) -> int:
-    """Flag served requests between the last matching check and the detection (idempotent)."""
+def flag_window(session: Session, binding: Binding, since: datetime) -> int:
+    """Flag every served request since the start of the last matching check's reads (idempotent).
+
+    No upper bound (B1-001): requests served while the mismatching reads ran, or after them and
+    before this commit, are included; the binding lock keeps new decisions out until commit.
+    """
     result = session.execute(
         text(
             "UPDATE request_log SET flags = array_append(flags, :flag) "
             "WHERE project_id = :p AND alias = :a AND route_id = :r AND state <> 'rejected' "
-            "AND received_at >= :since AND received_at <= :until AND NOT (:flag = ANY(flags))"
+            "AND received_at >= :since AND NOT (:flag = ANY(flags))"
         ),
         {"flag": WINDOW_FLAG, "p": binding.project_id, "a": binding.alias, "r": binding.route_id,
-         "since": since, "until": until},
+         "since": since},
     )
     return int(result.rowcount)  # type: ignore[attr-defined]
 
 
 def suspend_route(session: Session, route_id: str, checked_at: datetime, reason: str) -> bool:
-    """Suspend for every tenant; an older result than the stored one is ignored (R-01)."""
+    """Suspend for every tenant. A mismatch always suspends an active route, however late it arrives;
+    only resuming is guarded (newer match, operator only)."""
     result = session.execute(
         update(Route)
-        .where(Route.id == route_id, Route.global_status == "active",
-               (Route.status_checked_at.is_(None)) | (Route.status_checked_at < checked_at))
+        .where(Route.id == route_id, Route.global_status == "active")
         .values(global_status="suspended", status_reason=reason, status_changed_at=checked_at,
-                status_checked_at=checked_at)
+                status_checked_at=func.greatest(func.coalesce(Route.status_checked_at, checked_at), checked_at))
     )
     return bool(result.rowcount)  # type: ignore[attr-defined]
 
@@ -279,3 +298,23 @@ def resume_route(session: Session, route_id: str, operator_id: uuid.UUID, now: d
         .values(global_status="active", status_reason="operator_resume", status_changed_at=now)
     )
     session.flush()
+
+
+COMPLETED_RESULTS = ("match", "config_mismatch", "definition_mismatch")
+
+
+def lookback_start(session: Session, binding_id: uuid.UUID) -> datetime | None:
+    """Start of the reads of the last check whose reads completed (B1-002).
+
+    A failed check (``access_failed``/``error``) never moves the activity look-back forward: the
+    period it did not read stays open until a completed check covers it.
+    """
+    row = session.execute(
+        select(Verification.provider_answer, Verification.checked_at)
+        .where(Verification.binding_id == binding_id, Verification.result.in_(COMPLETED_RESULTS))
+        .order_by(Verification.checked_at.desc()).limit(1)
+    ).first()
+    if row is None:
+        return None
+    started = (row.provider_answer or {}).get("coverage", {}).get("reads_started_at")
+    return datetime.fromisoformat(started) if started else row.checked_at

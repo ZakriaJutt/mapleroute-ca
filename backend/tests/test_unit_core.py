@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import uuid
@@ -13,10 +14,11 @@ from core import logging as mr_logging
 from core.allowlist import build_version, load_verified
 from core.eligibility import BindingState, Decision, Rejection, evaluate
 from core.errors import CONTRACT, Code, error_body
+from core.fakes import FakeInference
 from core.regions import ArnError, regions_of_arns
 from core.requestlog import STATES, allowed
 from core.secretvalue import SecretValue
-from gateway.forward import forward
+from gateway.forward import forward, validated_body
 from tests.helpers import fixture_routes
 
 NOW = datetime(2026, 11, 11, 10, 0, tzinfo=UTC)
@@ -88,10 +90,42 @@ def test_no_version_or_no_binding_rejects() -> None:
 
 
 def test_decision_cannot_be_built_outside_the_evaluator() -> None:
+    forged = Decision(uuid.uuid4(), uuid.uuid4(), AWS, "aws", "ca-central-1", "h", "i", "v", "active", NOW)
+    assert not forged.is_sealed()
     with pytest.raises(TypeError):
-        Decision(uuid.uuid4(), uuid.uuid4(), AWS, "aws", "ca-central-1", "h", "i", "v", "active", NOW)
+        forward({"aws": FakeInference()}, forged, "chat", {}, SecretValue("x"))
     with pytest.raises(TypeError):
         forward({}, object(), "chat", {}, SecretValue("x"))  # type: ignore[arg-type]
+
+
+def test_b1_007_replace_on_a_sealed_decision_unseals_it() -> None:
+    """Regression (adversarial A5): a copy re-targeted with dataclasses.replace is refused."""
+    d = evaluate(state(AZ), DOC, NOW)
+    assert isinstance(d, Decision) and d.is_sealed()
+    assert dataclasses.replace(d).is_sealed()  # an identical copy targets the same place
+    for change in ({"upstream_host": "evil-global.openai.azure.com"}, {"source_region": "eastus"},
+                   {"upstream_identifier": "gpt-4o-global"}, {"route_id": "azure:x"}):
+        moved = dataclasses.replace(d, **change)  # type: ignore[arg-type]
+        assert not moved.is_sealed()
+        fake = FakeInference()
+        with pytest.raises(TypeError):
+            forward({"azure": fake}, moved, "chat", {}, SecretValue("x"))
+        assert fake.calls == []
+
+
+def test_b1_009_adapter_receives_only_validated_fields() -> None:
+    """The client's `model` and any routing field never reach an adapter; `model` is the Decision's."""
+    d = evaluate(state(AZ), DOC, NOW)
+    assert isinstance(d, Decision)
+    fake = FakeInference()
+    body = {"model": "client-chosen-global", "messages": [], "temperature": 0.1, "deployment": "global-dep",
+            "api_base": "https://evil.example", "region": "eastus", "extra_body": {"x": 1}}
+    forward({"azure": fake}, d, "chat", body, SecretValue("x"))
+    [call] = fake.calls
+    assert call.model == "dep-1"
+    assert call.body_keys == ("messages", "model", "temperature")
+    assert validated_body("embeddings", {"model": "m", "input": "x", "deployment": "y"}, d) == {
+        "input": "x", "model": "dep-1"}
 
 
 def test_error_contract_forwarded_flag() -> None:

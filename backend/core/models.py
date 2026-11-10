@@ -294,6 +294,7 @@ class Binding(Base):
         ),
         UniqueConstraint("project_id", "alias", name="uq_binding_project_alias"),
         UniqueConstraint("tenant_id", "id", name="uq_binding_tenant_id"),
+        UniqueConstraint("tenant_id", "id", "route_id", name="uq_binding_tenant_id_route"),
         Index("ix_binding_route", "route_id"),
     )
 
@@ -312,8 +313,10 @@ class Verification(Base):
     grade: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = _created()
     __table_args__ = (
+        # The route recorded on a check must be its binding's route (B1-005).
         ForeignKeyConstraint(
-            ["tenant_id", "binding_id"], ["binding.tenant_id", "binding.id"], name="fk_verification_binding"
+            ["tenant_id", "binding_id", "route_id"], ["binding.tenant_id", "binding.id", "binding.route_id"],
+            name="fk_verification_binding_route",
         ),
         CheckConstraint(
             "result IN ('match', 'config_mismatch', 'definition_mismatch', 'access_failed', 'error')",

@@ -15,7 +15,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from core import alerts, jobs, policy_store, requestlog, tenancy, verification
+from core import alerts, clock, jobs, locks, policy_store, requestlog, tenancy, verification
 from core.allowlist import RouteKey
 from core.config import CHECK_INTERVAL, FORWARDING_SWEEP_AFTER
 from core.crypto import KeyService, decrypt_secret
@@ -34,11 +34,18 @@ class WorkerServices:
 
 def verify_binding(session: Session, services: WorkerServices, tenant_id: uuid.UUID, binding_id: uuid.UUID,
                    now: datetime) -> verification.Applied:
+    """Read the provider, then lock the binding and apply (B1-001, B1-002, B1-003).
+
+    ``now`` is when the job started. The reads run without holding the binding lock; ``checked_at``
+    is the end of the reads; the result is decided only after the lock is held.
+    """
     tenancy.set_tenant(session, tenant_id)
-    binding = session.execute(select(Binding).where(Binding.id == binding_id).with_for_update()).scalar_one()
+    binding = session.execute(select(Binding).where(Binding.id == binding_id)).scalar_one()
     route = session.get(Route, binding.route_id)
-    connection = session.get(ProviderConnection, binding.connection_id)
-    assert route is not None and connection is not None
+    found_connection = session.get(ProviderConnection, binding.connection_id)
+    if route is None or found_connection is None:
+        raise LookupError("binding references a missing route or connection")
+    connection: ProviderConnection = found_connection
     key = RouteKey(route.provider, route.source_region, route.deployment_class, route.identifier,
                    route.model_version)
     active = policy_store.load_active(session)
@@ -64,12 +71,20 @@ def verify_binding(session: Session, services: WorkerServices, tenant_id: uuid.U
         assert connection.endpoint_host and connection.resource_group and binding.deployment_name
         target_az = AzureTarget(connection.id, connection.account_ref, connection.endpoint_host,
                                 connection.resource_group, binding.deployment_name, credential)
-        previous = binding.last_checked_at or binding.last_verified_at
         return verification.check_azure(key, target_az, services.azure_reader, binding.provider_modified_at,
-                                         previous)
+                                         lookback)
 
+    # The activity look-back starts at the last check whose reads completed, never at a failed one.
+    lookback = verification.lookback_start(session, binding.id) or binding.last_verified_at
+    reads_started = min(now, clock.now())
     outcome = verification.guarded(run)
-    applied = verification.apply_outcome(session, binding, outcome, now, version, services.pager)
+    checked_at = max(now, clock.now())  # coverage ends when the reads end
+    locks.binding_lock(session, binding.project_id, binding.alias, shared=False)
+    binding = session.execute(
+        select(Binding).where(Binding.id == binding_id).with_for_update().execution_options(populate_existing=True)
+    ).scalar_one()
+    applied = verification.apply_outcome(session, binding, outcome, checked_at, version, services.pager,
+                                         reads_started_at=reads_started)
     log_event("verification_applied", tenant_id=tenant_id, binding_id=binding_id, route_id=route.id,
               result=outcome.result, reason=outcome.reason, status="applied" if applied.applied else "stale")
     return applied

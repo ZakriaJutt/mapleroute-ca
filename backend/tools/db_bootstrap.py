@@ -20,7 +20,9 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 
 ALLOWED_DATABASES = ("mapleroute_dev", "mapleroute_test")
-APP_ROLE = "mapleroute_app"
+APP_ROLE = "mapleroute_app"  # B1 round 0 role; NOLOGIN and without privileges since 0003 (B1-005)
+PROCESS_ROLES = ("mapleroute_gateway", "mapleroute_console", "mapleroute_worker", "mapleroute_operator")
+DEFINER_ROLE = "mapleroute_definer"  # owns the SECURITY DEFINER functions; NOLOGIN, not a superuser
 BACKEND = Path(__file__).resolve().parent.parent
 
 
@@ -29,14 +31,19 @@ def owner_url(database: str) -> str:
 
 
 def ensure_role(database: str) -> None:
+    """Create the roles if missing. Every role is NOSUPERUSER NOBYPASSRLS; only process roles log in."""
     engine = create_engine(owner_url(database), isolation_level="AUTOCOMMIT")
+    wanted = {APP_ROLE: "NOLOGIN", DEFINER_ROLE: "NOLOGIN", **{r: "LOGIN" for r in PROCESS_ROLES}}
     with engine.connect() as conn:
-        exists = conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname = :r"), {"r": APP_ROLE}).first()
-        if not exists:
-            conn.execute(text(f"CREATE ROLE {APP_ROLE} LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE"))
-        conn.execute(text(f"ALTER ROLE {APP_ROLE} NOSUPERUSER NOBYPASSRLS"))
+        for role, login in wanted.items():
+            exists = conn.execute(text("SELECT 1 FROM pg_roles WHERE rolname = :r"), {"r": role}).first()
+            if not exists:
+                conn.execute(text(f"CREATE ROLE {role} {login} NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE"))
+            conn.execute(text(f"ALTER ROLE {role} {login} NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE"))
         for db in ALLOWED_DATABASES:
-            conn.execute(text(f"GRANT CONNECT ON DATABASE {db} TO {APP_ROLE}"))
+            conn.execute(text(f"REVOKE CONNECT ON DATABASE {db} FROM {APP_ROLE}"))
+            for role in PROCESS_ROLES:
+                conn.execute(text(f"GRANT CONNECT ON DATABASE {db} TO {role}"))
     engine.dispose()
 
 

@@ -16,7 +16,7 @@ from sqlalchemy.orm import sessionmaker
 
 from core import clock
 from core import logging as mr_logging
-from tests.helpers import APP_URL, OWNER_URL, World
+from tests.helpers import CONSOLE_URL, GATEWAY_URL, OPERATOR_URL, OWNER_URL, WORKER_URL, World
 from tools import db_bootstrap
 
 TABLES = (
@@ -40,10 +40,12 @@ def owner_engine():  # type: ignore[no-untyped-def]
 
 
 @pytest.fixture(scope="session")
-def app_engine():  # type: ignore[no-untyped-def]
-    eng = create_engine(APP_URL)
-    yield eng
-    eng.dispose()
+def role_engines():  # type: ignore[no-untyped-def]
+    engines = {name: create_engine(url) for name, url in (
+        ("gateway", GATEWAY_URL), ("console", CONSOLE_URL), ("worker", WORKER_URL), ("operator", OPERATOR_URL))}
+    yield engines
+    for eng in engines.values():
+        eng.dispose()
 
 
 class Clock:
@@ -74,8 +76,12 @@ def log_stream() -> Iterator[io.StringIO]:
 
 
 @pytest.fixture()
-def world(owner_engine, app_engine, fake_clock, log_stream) -> Iterator[World]:  # type: ignore[no-untyped-def]
+def world(owner_engine, role_engines, fake_clock, log_stream) -> Iterator[World]:  # type: ignore[no-untyped-def]
     with owner_engine.begin() as conn:
         conn.execute(text(f"TRUNCATE {TABLES} CASCADE"))
-    yield World(sessionmaker(bind=owner_engine, expire_on_commit=False),
-                sessionmaker(bind=app_engine, expire_on_commit=False), fake_clock, log_stream)
+
+    def mk(name: str) -> sessionmaker:  # type: ignore[type-arg]
+        return sessionmaker(bind=role_engines[name], expire_on_commit=False)
+
+    yield World(sessionmaker(bind=owner_engine, expire_on_commit=False), mk("worker"), fake_clock, log_stream,
+                gw=mk("gateway"), con=mk("console"), ops=mk("operator"))

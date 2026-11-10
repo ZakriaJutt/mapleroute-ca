@@ -34,7 +34,14 @@ from gateway.app import GatewayServices, RateLimiter
 from gateway.app import create_app as create_gateway
 from worker.jobs import WorkerServices, verify_binding
 
-APP_URL = "postgresql+psycopg://mapleroute_app@localhost:5432/mapleroute_test"
+
+def role_url(role: str) -> str:
+    return f"postgresql+psycopg://mapleroute_{role}@localhost:5432/mapleroute_test"
+
+
+GATEWAY_URL, CONSOLE_URL, WORKER_URL, OPERATOR_URL = (role_url(r) for r in ("gateway", "console", "worker", "operator"))
+# The internet-facing process role. (Was the single B1 role `mapleroute_app`, retired in 0003.)
+APP_URL = GATEWAY_URL
 OWNER_URL = "postgresql+psycopg://zakria@localhost:5432/mapleroute_test"
 FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "allowlist-2026.11.10-1.json"
 
@@ -59,9 +66,12 @@ class T:
 @dataclass
 class World:
     owner: sessionmaker[Session]
-    app: sessionmaker[Session]
+    app: sessionmaker[Session]  # worker role (verification, jobs)
     clock: Any
     logs: io.StringIO
+    gw: sessionmaker[Session]
+    con: sessionmaker[Session]
+    ops: sessionmaker[Session]
     inference: FakeInference = field(default_factory=FakeInference)
     aws_sessions: FakeAwsSessions = field(default_factory=FakeAwsSessions)
     aws_reader: FakeAwsReader = field(default_factory=FakeAwsReader)
@@ -84,9 +94,9 @@ class World:
 
     def activate(self, routes: list[dict[str, Any]] | None = None, version: str = "2026.11.10-1") -> None:
         op = self.operator()
-        with self.app.begin() as s:
+        with self.ops.begin() as s:
             policy_store.publish_draft(s, version, routes if routes is not None else fixture_routes(), op)
-        with self.app.begin() as s:
+        with self.ops.begin() as s:
             policy_store.approve(s, version, op, self.clock())
 
     # ------------------------------------------------------------- tenants
@@ -163,13 +173,14 @@ class World:
 
     def gateway(self, factory: sessionmaker[Session] | None = None) -> TestClient:
         services = GatewayServices(
-            factory=factory or self.app, clients={"aws": self.inference, "azure": self.inference},
+            factory=factory or self.gw, clients={"aws": self.inference, "azure": self.inference},
             aws_sessions=self.aws_sessions, key_service=self.key_service, limiter=RateLimiter(self.rate_limit),
         )
         return TestClient(create_gateway(services))
 
     def console(self, principal: Principal | None) -> TestClient:
-        return TestClient(create_console(ConsoleServices(self.app, self.key_service, lambda request: principal)))
+        return TestClient(create_console(ConsoleServices(self.con, self.key_service, lambda request: principal,
+                                                         ops_factory=self.ops)))
 
     @staticmethod
     def chat(client: TestClient, key: str, alias: str, **extra: Any) -> Any:

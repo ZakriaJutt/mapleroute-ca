@@ -58,7 +58,10 @@ def constants_hash() -> str:
 
 @dataclass(frozen=True)
 class Settings:
-    database_url: str
+    gateway_database_url: str
+    console_database_url: str
+    worker_database_url: str
+    operator_database_url: str
     migrate_database_url: str
     environment: str
     provider_mode: str
@@ -75,10 +78,17 @@ ALLOWED_PROVIDER_MODES = frozenset({"fake"})
 @lru_cache(maxsize=1)
 def settings() -> Settings:
     env = os.environ
+    db = env.get("MAPLEROUTE_DATABASE", "mapleroute_dev")
+
+    def role_url(role: str) -> str:
+        default = f"postgresql+psycopg://mapleroute_{role}@localhost:5432/{db}"
+        return env.get(f"MAPLEROUTE_{role.upper()}_DATABASE_URL", default)
+
     s = Settings(
-        database_url=env.get(
-            "MAPLEROUTE_DATABASE_URL", "postgresql+psycopg://mapleroute_app@localhost:5432/mapleroute_dev"
-        ),
+        gateway_database_url=role_url("gateway"),
+        console_database_url=role_url("console"),
+        worker_database_url=role_url("worker"),
+        operator_database_url=role_url("operator"),
         migrate_database_url=env.get(
             "MAPLEROUTE_MIGRATE_DATABASE_URL", "postgresql+psycopg://zakria@localhost:5432/mapleroute_dev"
         ),
