@@ -37,20 +37,20 @@ def differences(url: str, metadata: MetaData | None = None) -> list[str]:
             out.extend(str(d) for d in compare_metadata(ctx, metadata))
             insp = inspect(conn)
             for table in metadata.sorted_tables:
-                db_checks = {c["name"] for c in insp.get_check_constraints(table.name)}
-                db_uniques = {c["name"] for c in insp.get_unique_constraints(table.name)}
-                db_fks = {c["name"] for c in insp.get_foreign_keys(table.name)}
+                db_checks = {str(c["name"]) for c in insp.get_check_constraints(table.name)}
+                db_uniques = {str(c["name"]) for c in insp.get_unique_constraints(table.name)}
+                db_fks = {str(c["name"]) for c in insp.get_foreign_keys(table.name)}
                 db_indexes = {
-                    i["name"]: bool(i.get("dialect_options", {}).get("postgresql_where"))
+                    str(i["name"]): bool(i.get("dialect_options", {}).get("postgresql_where"))
                     for i in insp.get_indexes(table.name)
                     if not i.get("duplicates_constraint")
                 }
                 db_nullable = {c["name"]: c["nullable"] for c in insp.get_columns(table.name)}
                 db_defaults = {c["name"]: c.get("default") is not None for c in insp.get_columns(table.name)}
-                m_checks = {c.name for c in table.constraints if isinstance(c, CheckConstraint)}
-                m_uniques = {c.name for c in table.constraints if isinstance(c, UniqueConstraint)}
-                m_fks = {c.name for c in table.constraints if isinstance(c, ForeignKeyConstraint) and c.name}
-                m_indexes = {i.name: "postgresql_where" in i.dialect_kwargs and
+                m_checks = {str(c.name) for c in table.constraints if isinstance(c, CheckConstraint)}
+                m_uniques = {str(c.name) for c in table.constraints if isinstance(c, UniqueConstraint)}
+                m_fks = {str(c.name) for c in table.constraints if isinstance(c, ForeignKeyConstraint) and c.name}
+                m_indexes = {str(i.name): "postgresql_where" in i.dialect_kwargs and
                              i.dialect_kwargs["postgresql_where"] is not None for i in table.indexes}
                 for label, model_set, db_set in (
                     ("check", m_checks, db_checks),

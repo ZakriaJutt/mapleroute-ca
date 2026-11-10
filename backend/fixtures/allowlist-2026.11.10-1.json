@@ -1,0 +1,379 @@
+{
+ "_note": "B1 draft fixture built from Decision.md section 4.1 (read 2026-11-10). Bedrock model identifiers and Azure model versions are assumptions [A] (versions marked 'assumed-1' are unknown) and must be re-read from the provider pages and APIs before any operator approval. Synthetic; not an approved allow-list.",
+ "version": "2026.11.10-1",
+ "routes": [
+  {
+   "id": "aws:ca-central-1:geo_ca:ca.amazon.nova-lite-v1:0",
+   "provider": "aws",
+   "source_region": "ca-central-1",
+   "deployment_class": "geo_ca",
+   "identifier": "ca.amazon.nova-lite-v1:0",
+   "model_version": null,
+   "destinations": [
+    "ca-central-1",
+    "ca-west-1"
+   ]
+  },
+  {
+   "id": "aws:ca-central-1:geo_ca:ca.anthropic.claude-haiku-5-5",
+   "provider": "aws",
+   "source_region": "ca-central-1",
+   "deployment_class": "geo_ca",
+   "identifier": "ca.anthropic.claude-haiku-5-5",
+   "model_version": null,
+   "destinations": [
+    "ca-central-1",
+    "ca-west-1"
+   ]
+  },
+  {
+   "id": "aws:ca-central-1:in_region:amazon.rerank-v1:0",
+   "provider": "aws",
+   "source_region": "ca-central-1",
+   "deployment_class": "in_region",
+   "identifier": "amazon.rerank-v1:0",
+   "model_version": null,
+   "destinations": [
+    "ca-central-1"
+   ]
+  },
+  {
+   "id": "aws:ca-central-1:in_region:amazon.titan-embed-image-v1",
+   "provider": "aws",
+   "source_region": "ca-central-1",
+   "deployment_class": "in_region",
+   "identifier": "amazon.titan-embed-image-v1",
+   "model_version": null,
+   "destinations": [
+    "ca-central-1"
+   ]
+  },
+  {
+   "id": "aws:ca-central-1:in_region:amazon.titan-embed-text-v2:0",
+   "provider": "aws",
+   "source_region": "ca-central-1",
+   "deployment_class": "in_region",
+   "identifier": "amazon.titan-embed-text-v2:0",
+   "model_version": null,
+   "destinations": [
+    "ca-central-1"
+   ]
+  },
+  {
+   "id": "aws:ca-central-1:in_region:anthropic.claude-3-haiku-20240307-v1:0",
+   "provider": "aws",
+   "source_region": "ca-central-1",
+   "deployment_class": "in_region",
+   "identifier": "anthropic.claude-3-haiku-20240307-v1:0",
+   "model_version": null,
+   "destinations": [
+    "ca-central-1"
+   ]
+  },
+  {
+   "id": "aws:ca-central-1:in_region:cohere.embed-english-v3",
+   "provider": "aws",
+   "source_region": "ca-central-1",
+   "deployment_class": "in_region",
+   "identifier": "cohere.embed-english-v3",
+   "model_version": null,
+   "destinations": [
+    "ca-central-1"
+   ]
+  },
+  {
+   "id": "aws:ca-central-1:in_region:cohere.embed-multilingual-v3",
+   "provider": "aws",
+   "source_region": "ca-central-1",
+   "deployment_class": "in_region",
+   "identifier": "cohere.embed-multilingual-v3",
+   "model_version": null,
+   "destinations": [
+    "ca-central-1"
+   ]
+  },
+  {
+   "id": "aws:ca-central-1:in_region:cohere.rerank-v3-5:0",
+   "provider": "aws",
+   "source_region": "ca-central-1",
+   "deployment_class": "in_region",
+   "identifier": "cohere.rerank-v3-5:0",
+   "model_version": null,
+   "destinations": [
+    "ca-central-1"
+   ]
+  },
+  {
+   "id": "aws:ca-central-1:in_region:meta.llama3-70b-instruct-v1:0",
+   "provider": "aws",
+   "source_region": "ca-central-1",
+   "deployment_class": "in_region",
+   "identifier": "meta.llama3-70b-instruct-v1:0",
+   "model_version": null,
+   "destinations": [
+    "ca-central-1"
+   ]
+  },
+  {
+   "id": "aws:ca-central-1:in_region:meta.llama3-8b-instruct-v1:0",
+   "provider": "aws",
+   "source_region": "ca-central-1",
+   "deployment_class": "in_region",
+   "identifier": "meta.llama3-8b-instruct-v1:0",
+   "model_version": null,
+   "destinations": [
+    "ca-central-1"
+   ]
+  },
+  {
+   "id": "aws:ca-central-1:in_region:mistral.mistral-7b-instruct-v0:2",
+   "provider": "aws",
+   "source_region": "ca-central-1",
+   "deployment_class": "in_region",
+   "identifier": "mistral.mistral-7b-instruct-v0:2",
+   "model_version": null,
+   "destinations": [
+    "ca-central-1"
+   ]
+  },
+  {
+   "id": "aws:ca-central-1:in_region:mistral.mistral-large-2402-v1:0",
+   "provider": "aws",
+   "source_region": "ca-central-1",
+   "deployment_class": "in_region",
+   "identifier": "mistral.mistral-large-2402-v1:0",
+   "model_version": null,
+   "destinations": [
+    "ca-central-1"
+   ]
+  },
+  {
+   "id": "aws:ca-central-1:in_region:mistral.mixtral-8x7b-instruct-v0:1",
+   "provider": "aws",
+   "source_region": "ca-central-1",
+   "deployment_class": "in_region",
+   "identifier": "mistral.mixtral-8x7b-instruct-v0:1",
+   "model_version": null,
+   "destinations": [
+    "ca-central-1"
+   ]
+  },
+  {
+   "id": "azure:canadacentral:ProvisionedManaged:gpt-4.1:2025-04-14",
+   "provider": "azure",
+   "source_region": "canadacentral",
+   "deployment_class": "ProvisionedManaged",
+   "identifier": "gpt-4.1",
+   "model_version": "2025-04-14",
+   "destinations": [
+    "canadacentral",
+    "canadaeast"
+   ]
+  },
+  {
+   "id": "azure:canadacentral:ProvisionedManaged:gpt-4o-mini:2024-07-18",
+   "provider": "azure",
+   "source_region": "canadacentral",
+   "deployment_class": "ProvisionedManaged",
+   "identifier": "gpt-4o-mini",
+   "model_version": "2024-07-18",
+   "destinations": [
+    "canadacentral",
+    "canadaeast"
+   ]
+  },
+  {
+   "id": "azure:canadacentral:ProvisionedManaged:gpt-4o:2024-05-13",
+   "provider": "azure",
+   "source_region": "canadacentral",
+   "deployment_class": "ProvisionedManaged",
+   "identifier": "gpt-4o",
+   "model_version": "2024-05-13",
+   "destinations": [
+    "canadacentral",
+    "canadaeast"
+   ]
+  },
+  {
+   "id": "azure:canadacentral:ProvisionedManaged:gpt-5.2:assumed-1",
+   "provider": "azure",
+   "source_region": "canadacentral",
+   "deployment_class": "ProvisionedManaged",
+   "identifier": "gpt-5.2",
+   "model_version": "assumed-1",
+   "destinations": [
+    "canadacentral",
+    "canadaeast"
+   ]
+  },
+  {
+   "id": "azure:canadaeast:ProvisionedManaged:gpt-4o-mini:2024-07-18",
+   "provider": "azure",
+   "source_region": "canadaeast",
+   "deployment_class": "ProvisionedManaged",
+   "identifier": "gpt-4o-mini",
+   "model_version": "2024-07-18",
+   "destinations": [
+    "canadacentral",
+    "canadaeast"
+   ]
+  },
+  {
+   "id": "azure:canadaeast:ProvisionedManaged:gpt-4o:2024-05-13",
+   "provider": "azure",
+   "source_region": "canadaeast",
+   "deployment_class": "ProvisionedManaged",
+   "identifier": "gpt-4o",
+   "model_version": "2024-05-13",
+   "destinations": [
+    "canadacentral",
+    "canadaeast"
+   ]
+  },
+  {
+   "id": "azure:canadaeast:ProvisionedManaged:gpt-4o:2024-08-06",
+   "provider": "azure",
+   "source_region": "canadaeast",
+   "deployment_class": "ProvisionedManaged",
+   "identifier": "gpt-4o",
+   "model_version": "2024-08-06",
+   "destinations": [
+    "canadacentral",
+    "canadaeast"
+   ]
+  },
+  {
+   "id": "azure:canadaeast:ProvisionedManaged:gpt-4o:2024-11-20",
+   "provider": "azure",
+   "source_region": "canadaeast",
+   "deployment_class": "ProvisionedManaged",
+   "identifier": "gpt-4o",
+   "model_version": "2024-11-20",
+   "destinations": [
+    "canadacentral",
+    "canadaeast"
+   ]
+  },
+  {
+   "id": "azure:canadaeast:ProvisionedManaged:gpt-5-mini:2025-08-07",
+   "provider": "azure",
+   "source_region": "canadaeast",
+   "deployment_class": "ProvisionedManaged",
+   "identifier": "gpt-5-mini",
+   "model_version": "2025-08-07",
+   "destinations": [
+    "canadacentral",
+    "canadaeast"
+   ]
+  },
+  {
+   "id": "azure:canadaeast:ProvisionedManaged:gpt-5.1:assumed-1",
+   "provider": "azure",
+   "source_region": "canadaeast",
+   "deployment_class": "ProvisionedManaged",
+   "identifier": "gpt-5.1",
+   "model_version": "assumed-1",
+   "destinations": [
+    "canadacentral",
+    "canadaeast"
+   ]
+  },
+  {
+   "id": "azure:canadaeast:ProvisionedManaged:gpt-5.2:assumed-1",
+   "provider": "azure",
+   "source_region": "canadaeast",
+   "deployment_class": "ProvisionedManaged",
+   "identifier": "gpt-5.2",
+   "model_version": "assumed-1",
+   "destinations": [
+    "canadacentral",
+    "canadaeast"
+   ]
+  },
+  {
+   "id": "azure:canadaeast:ProvisionedManaged:gpt-5:2025-08-07",
+   "provider": "azure",
+   "source_region": "canadaeast",
+   "deployment_class": "ProvisionedManaged",
+   "identifier": "gpt-5",
+   "model_version": "2025-08-07",
+   "destinations": [
+    "canadacentral",
+    "canadaeast"
+   ]
+  },
+  {
+   "id": "azure:canadaeast:ProvisionedManaged:o3-mini:2025-01-31",
+   "provider": "azure",
+   "source_region": "canadaeast",
+   "deployment_class": "ProvisionedManaged",
+   "identifier": "o3-mini",
+   "model_version": "2025-01-31",
+   "destinations": [
+    "canadacentral",
+    "canadaeast"
+   ]
+  },
+  {
+   "id": "azure:canadaeast:Standard:gpt-4.1-mini:2025-04-14",
+   "provider": "azure",
+   "source_region": "canadaeast",
+   "deployment_class": "Standard",
+   "identifier": "gpt-4.1-mini",
+   "model_version": "2025-04-14",
+   "destinations": [
+    "canadacentral",
+    "canadaeast"
+   ]
+  },
+  {
+   "id": "azure:canadaeast:Standard:gpt-4o:2024-11-20",
+   "provider": "azure",
+   "source_region": "canadaeast",
+   "deployment_class": "Standard",
+   "identifier": "gpt-4o",
+   "model_version": "2024-11-20",
+   "destinations": [
+    "canadacentral",
+    "canadaeast"
+   ]
+  },
+  {
+   "id": "azure:canadaeast:Standard:text-embedding-3-large:1",
+   "provider": "azure",
+   "source_region": "canadaeast",
+   "deployment_class": "Standard",
+   "identifier": "text-embedding-3-large",
+   "model_version": "1",
+   "destinations": [
+    "canadacentral",
+    "canadaeast"
+   ]
+  },
+  {
+   "id": "azure:canadaeast:Standard:text-embedding-3-small:1",
+   "provider": "azure",
+   "source_region": "canadaeast",
+   "deployment_class": "Standard",
+   "identifier": "text-embedding-3-small",
+   "model_version": "1",
+   "destinations": [
+    "canadacentral",
+    "canadaeast"
+   ]
+  },
+  {
+   "id": "azure:canadaeast:Standard:text-embedding-ada-002:2",
+   "provider": "azure",
+   "source_region": "canadaeast",
+   "deployment_class": "Standard",
+   "identifier": "text-embedding-ada-002",
+   "model_version": "2",
+   "destinations": [
+    "canadacentral",
+    "canadaeast"
+   ]
+  }
+ ],
+ "sha256": "10563e9e96a1e68c70764c9230f6d4f915837a5432d573f46799f964d122157f"
+}

@@ -22,7 +22,7 @@ dev = ["pytest==8.3.5", "httpx==0.28.1", "ruff==0.8.6", "mypy==1.13.0"]
 include = ["core*", "gateway*", "console*", "worker*", "tools*"]
 
 [tool.ruff]
-line-length = 110
+line-length = 120
 target-version = "py312"
 extend-exclude = [".venv"]
 
