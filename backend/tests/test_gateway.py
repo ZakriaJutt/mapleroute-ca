@@ -77,7 +77,7 @@ def test_it02_streaming_passes_chunks_and_records_client_abort(world: World) -> 
         assert b"".join(r.iter_bytes()) == b"data: 1\n\ndata: 2\n\ndata: 3\n\n"
     assert rows(world)[-1].state == "completed"
     # Simulated disconnect: the response iterator is closed after the first chunk.
-    app = gw.app
+    app = world_app(gw)
     world.inference.chunks = [b"a", b"b", b"c"]
     import asyncio
 
@@ -93,7 +93,7 @@ def test_it02_streaming_passes_chunks_and_records_client_abort(world: World) -> 
             return {"type": "http.request", "body": body, "more_body": False}
 
         route = next(rt for rt in app.routes if getattr(rt, "path", "") == "/v1/chat/completions")
-        response = await route.endpoint(Request(scope, receive))  # type: ignore[attr-defined]
+        response = await route.endpoint(Request(scope, receive))
         iterator = response.body_iterator
         first = await iterator.__anext__()
         await iterator.aclose()
@@ -101,6 +101,10 @@ def test_it02_streaming_passes_chunks_and_records_client_abort(world: World) -> 
 
     assert asyncio.run(run()) == b"a"
     assert rows(world)[-1].state == "client_aborted"
+
+
+def world_app(client: Any) -> Any:
+    return client.app
 
 
 def ineligible_cases(world: World, t: T, ids: dict[str, uuid.UUID]) -> list[tuple[str, dict[str, Any], str]]:

@@ -37,7 +37,7 @@ ignore = ["S101", "S608"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-packages = ["core", "gateway", "console", "worker", "tools"]
+packages = ["core", "gateway", "console", "worker", "tools", "tests"]
 plugins = []
 
 [[tool.mypy.overrides]]

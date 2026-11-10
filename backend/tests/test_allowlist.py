@@ -141,7 +141,7 @@ def test_at_most_one_active_version(world: World) -> None:
     routes = [r for r in fixture_routes() if r["provider"] == "aws"]
     world.activate(routes, version="2026.11.11-1")
     with world.app.begin() as s:
-        states = dict(s.execute(text("SELECT version, state FROM allowlist_version")).all())
+        states = {r[0]: r[1] for r in s.execute(text("SELECT version, state FROM allowlist_version"))}
         active = policy_store.load_active(s)
     assert states == {"2026.11.10-1": "superseded", "2026.11.11-1": "active"}
     assert active is not None and len(active.entries) == 14

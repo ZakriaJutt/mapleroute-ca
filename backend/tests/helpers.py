@@ -6,7 +6,6 @@ import io
 import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +41,6 @@ FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "allowlist-2026.
 HAIKU = "aws:ca-central-1:geo_ca:ca.anthropic.claude-haiku-5-5"
 TITAN = "aws:ca-central-1:in_region:amazon.titan-embed-text-v2:0"
 GPT4O = "azure:canadaeast:Standard:gpt-4o:2024-11-20"
-CREATED = datetime(2026, 11, 1, 9, 0)
 
 
 def fixture_routes() -> list[dict[str, Any]]:
@@ -127,7 +125,8 @@ class World:
             s.flush()
             return c.id
 
-    def azure_conn(self, t: T, host: str, secret: str = "synthetic-azure-key", region: str = "canadaeast") -> uuid.UUID:
+    def azure_conn(self, t: T, host: str, secret: str = "synthetic-azure-key",  # noqa: S107 - synthetic
+                   region: str = "canadaeast") -> uuid.UUID:
         with self.owner.begin() as s:
             c = ProviderConnection(tenant_id=t.tenant_id, project_id=t.project_id, provider="azure",
                                    account_ref=f"/subscriptions/synthetic/{host}", source_region=region,
