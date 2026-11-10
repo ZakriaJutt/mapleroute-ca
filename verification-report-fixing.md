@@ -2,7 +2,7 @@
 
 **Question this file answers:** what passed, what failed, and what remains untested?
 
-This repository contains planning documents only. No application, script, migration, test or environment exists. Every application check below is planned and marked **Not run**. A planned control is not evidence of compliance. A provider's documentation is not proof of where a request was processed.
+Until 2026-11-10 this repository contained planning documents only. Build milestone B1 (2026-11-11) added a backend with migrations and tests; what ran is recorded in [section 2a](#2a-build-milestone-b1-2026-11-11). Every other application check below is planned and marked **Not run**. A planned control is not evidence of compliance. A provider's documentation is not proof of where a request was processed.
 
 IDs: must-haves `MH-01`–`MH-15` ([PRD.md](PRD.md#must-haves)); screens `S-01`–`S-15` ([App-flow.md](App-flow.md#screen-and-route-inventory)); architecture decisions `AD-01`–`AD-14` ([TRD.md](TRD.md#9-architecture-decisions)); tasks `T-…` and tests `UT-`, `IT-`, `E2E-` ([execution-plan.md](execution-plan.md#planned-tests)); risks `R-01`–`R-22` (this file); author self-checks `SC-…` (this file); review findings `F-001…` (this file, reserved for the independent reviewer).
 
@@ -33,27 +33,84 @@ All **Not run**.
 
 | Area | Tests | Status |
 |---|---|---|
-| Eligibility and allow-list | UT-01, UT-02, UT-03 | Not run |
-| Fail-closed forwarding | IT-03, IT-04, IT-20 | Not run |
-| Normal forwarding and streaming | IT-01, IT-02 | Not run |
-| Verification, mismatch kinds and suspension | UT-06, UT-10, IT-05, IT-10 | Not run |
-| Customer-side policy, Azure change window, customer logging state | IT-21, IT-22 | Not run |
+| Eligibility and allow-list | UT-01, UT-02, UT-03 | Ran in B1, passed (section 2a) |
+| Fail-closed forwarding | IT-03, IT-04, IT-20 | IT-03, IT-04 ran in B1 against the provider stub, passed; IT-20 Not run |
+| Normal forwarding and streaming | IT-01, IT-02 | IT-01 passed on the stub; IT-02 passed with a simulated disconnect (section 2a) |
+| Verification, mismatch kinds and suspension | UT-06, UT-10, IT-05, IT-10 | UT-06, UT-10, IT-05 passed on fakes; IT-10 partly (alert rows, no delivery) |
+| Customer-side policy, Azure change window, customer logging state | IT-21, IT-22 | Passed on fakes (three IT-21 variants); not on real accounts (T-6.1.1) |
 | Sign-in, identity and operator access | UT-13 | Not run |
-| No content or credential persistence | UT-07, IT-06, IT-07 | Not run |
-| Tenant isolation and roles | UT-12, IT-08 | Not run |
-| Request state and timeouts | UT-05, IT-09 | Not run |
+| No content or credential persistence | UT-07, IT-06, IT-07 | UT-07 passed; IT-06 partly (database and application logs; bucket and restored backup Not run); IT-07 Not run |
+| Tenant isolation and roles | UT-12, IT-08 | IT-08 passed (rows, API, job; no files exist yet); UT-12 Not run |
+| Request state and timeouts | UT-05, IT-09 | Passed |
 | Report and register | UT-08, IT-16 | Not run |
 | Reconciliation | IT-11 | Not run |
 | Watcher | IT-17 | Not run |
 | Retention, deletion, restore | IT-13, IT-15 | Not run |
-| Migrations | IT-14 | Not run |
+| Migrations | IT-14 | Partly: ORM parity part passed; head check and backfill resume Not run |
 | Performance | IT-12 | Not run |
-| Startup and logging | IT-18 | Not run |
+| Startup and logging | IT-18 | Partly: worker starts without web packages, constants hash equal across processes, `make smoke` green; clean machine and read-only containers Not run |
 | Billing | UT-09, IT-19 | Not run |
 | Files and links | UT-11 | Not run |
 | Console journeys | E2E-01 to E2E-05, E2E-07 | Not run |
 | Accessibility (manual) | E2E-06 | Not run |
 | Security requirements listed in [TRD.md](TRD.md#8-crosscutting-concepts) | Review against ASVS 5.0.0 text | Not run; six rows listed as not met or partly met |
+
+## 2a. Build milestone B1 (2026-11-11)
+
+**Authorisation.** On 2026-11-11 the owner authorised implementation in this repository before the Phase 0 sales gate (T-0.6.1) had passed. Decision.md still records the author's recommendation and is unchanged; this row is the record of the override. Phase 0 tasks remain open.
+
+**Environment.** macOS developer machine (not `ca-central-1`); Python 3.12.16; PostgreSQL 16 at localhost; databases `mapleroute_dev`, `mapleroute_test`; application role `mapleroute_app` (NOSUPERUSER, NOBYPASSRLS), all tenant tables FORCE ROW LEVEL SECURITY. AWS, Azure, KMS, alert delivery and sign-in are interfaces with in-memory fakes only; no real cloud call was made. Redis is not used.
+
+**Tasks implemented** (code in `backend/`): T-2.1.1 (layout and import-boundary check), T-2.1.2 (one start command with readiness checks, adapted: processes run directly, no Compose), T-2.2.1 (migrations, RLS, grants, immutability and transition triggers), T-2.2.2 (ORM parity check), T-3.1.1 (allow-list loader, evaluator, `Decision` type), T-3.1.2 (key hashing, tenant from key, per-key rate limit in memory), T-3.1.3 (audit-before-forward, compare-and-set, trigger), T-3.1.6 (error contract, timeouts mapped, no retry, provider text dropped), T-3.1.7 (outcome sweeper, late reconciliation), T-3.1.8 (`core.logging` field allow-list, correlation ID), T-4.1.5 (verification job on fakes: ordering rule, two mismatch kinds, resume needs newer match), T-4.1.9 (L2 reads, Azure timestamp and activity look-back, window flagging, logging-state reads, on fakes). Partly: T-3.1.4 and T-3.1.5 (interfaces and stub only; envelope decryption in memory), T-4.1.3 (key create show-once and revoke API, no screens), T-4.1.4 (envelope encryption with a fake key service; no policy templates), T-4.1.8 (operator publish, two-step approve with typed confirmation, suspend, resume API; no screens, no `allowlist_change_notice` alert), T-5.1.2 (only the Azure route-line figures and wording, `core/window.py`).
+
+**Commands and results** (run from `mapleroute-ca/`):
+
+| Command | Result |
+|---|---|
+| `make test` (drops and re-migrates `mapleroute_test`, then `pytest`) | 72 passed, 0 failed |
+| `make orm-parity` | `orm parity: OK` |
+| `make lint` (ruff 0.8.6) | All checks passed |
+| `make typecheck` (mypy 1.13, strict, 47 files incl. tests) | No issues |
+| `make check-imports` | `import boundaries: OK` |
+| `make smoke` (migrate dev, start gateway :8110, console :3110, worker, health summary, stop) | Three services ok, same constants hash; exit 0 |
+
+**Tests that ran** (file `backend/tests/…`; all synthetic):
+
+| Test | Function(s) | Result | Scope note |
+|---|---|---|---|
+| UT-01 | `test_allowlist.py::test_ut01_*` | Passed | Only the `ca.` profile is eligible; prefix never substitutes for destinations |
+| UT-02 | `test_ut02_draft_with_one_us_destination_is_refused_naming_the_route` | Passed | — |
+| UT-03 | `test_ut03_altered_byte_gives_policy_unavailable`, `test_ut03_db_altered_document_rejects_requests` | Passed | Also through the gateway after altering the stored row behind the trigger |
+| UT-04 | `test_gateway.py::test_ut04_valid_revoked_malformed_keys` | Passed | — |
+| UT-05 | `test_unit_core.py::test_ut05_only_listed_transitions`; trigger in IT-09 test | Passed | — |
+| UT-06 | `test_verification.py::test_ut06_late_match_after_mismatch_leaves_route_suspended` | Passed | — |
+| UT-07 | `test_ut07_body_and_authorization_never_logged`, `test_ut07_correlation_id_on_every_line` | Passed | Correlation ID into jobs is set by the worker; not separately asserted |
+| UT-10 | `test_ut10_three_model_arns_give_three_regions` | Passed | — |
+| IT-01 | `test_it01_eligible_request_forwarded_once_and_logged`, `test_it01_models_lists_only_bound_forwardable_aliases` | Passed | Provider stub, Bedrock and Azure shapes |
+| IT-02 | `test_it02_streaming_passes_chunks_and_records_client_abort` | Passed | Disconnect simulated by closing the response iterator, not a real socket |
+| IT-03 | `test_it03_fifty_ineligible_inputs_zero_outbound_calls` | Passed | 50 inputs plus a malformed body; stub recorded zero calls; 51 `rejected` rows |
+| IT-04 | `test_it04_database_down_rejects_audit_unavailable`, `test_it04_log_insert_failure_rejects_audit_unavailable` | Passed | Unreachable database, and insert privilege revoked |
+| IT-05 | `test_it05a_*`, `test_it05b_*`, `test_it05c_*`, `test_it05d_*` | Passed | Fakes |
+| IT-06 | `test_canary_and_boundaries.py::test_it06_canaries_never_reach_database_or_logs` | Passed, partly | Every table and the application log stream scanned; bucket and restored backup Not run (none exist) |
+| IT-08 | `test_it08_no_tenant_context_reads_zero_rows`, `test_it08_job_for_a_reads_zero_rows_of_b`, `test_it08_b_session_and_key_on_a_ids_get_404` | Passed | No files exist yet, so the file part is Not run |
+| IT-09 | `test_it09_sweeper_then_late_completion_reconciles` | Passed | — |
+| IT-10 | `test_it10_suspension_alerts_every_bound_tenant_once` | Passed, partly | Alert rows de-duplicated; delivery and the 5-minute bound Not run |
+| IT-14 | `test_it14_partial_parity_passes_and_a_removed_index_fails` | Passed, partly | Two-heads check and backfill resume Not run |
+| IT-18 | `test_it18_worker_starts_without_web_modules_and_hashes_agree`; `make smoke` | Passed, partly | Clean machine and read-only containers Not run |
+| IT-21 | `test_it21_variant1_*`, `test_it21_variant2_*` (with and without visible activity log), `test_it21_variant3_*` | Passed on fakes | Variant 3: requests served until exactly 60 minutes after the last matching check, rejected 1 s later; alert after the second failed check, once; line prints 3 failed checks and 60 minutes. Whether real Azure readers see these fields stays O-13 |
+| IT-22 | `test_it22_missing_l2_us_logging_and_broad_role_never_verified` | Passed on fakes | — |
+
+All other tests in [execution-plan.md](execution-plan.md#planned-tests) remain **Not run**.
+
+**Blocked, with reason.** T-6.1.1 and every real-account half of IT-03/IT-21 (no AWS or Azure test accounts in B1); T-3.1.4 and T-3.1.5 real adapters and the LiteLLM pin (no accounts; O-11 unverified); T-2.1.3, T-2.1.4, IT-20 (no AWS account, no deployment in scope); T-4.1.1, T-4.1.2, UT-12, UT-13 (OIDC needs registered identity-provider applications); IT-07 (needs the per-process database roles, see deviations); T-5.1.x, T-5.2.1 (reports, watcher, reconciliation, billing need real data sources or Stripe); T-1.1.3 Azure header check (needs a test deployment).
+
+**Deviations from the documents, recorded.**
+- One application role `mapleroute_app` serves all three processes (environment rule for B1). The per-process roles `mr_gateway`, `mr_console`, `mr_worker`, `mr_operator` of [schema.md](schema.md#roles-and-permissions) are not created, so the split encrypt/decrypt and the "console cannot select ciphertext" control are not in force locally.
+- `verification.route_id` added (the route compared at that check), so the resume trigger can find a newer match for a route without joining through a binding that may be re-bound. Index `ix_verification_route_match` added. Recorded in schema.md.
+- `request_log` primary key is (`id`, `received_at`) because PostgreSQL requires the partition key in it; one DEFAULT partition only; monthly partition creation is not built.
+- Two narrow `SECURITY DEFINER` functions: `resolve_api_key` (the key lookup runs before the tenant is known) and `tenants_bound_to_route` (tenant IDs only, for suspension fan-out and the 7-day removal rule). Recorded in schema.md.
+- Error contract: a request whose credential cannot be obtained (AWS role assumption or Azure secret decryption fails) is rejected as `route_unverified`, not forwarded; a body that is not a JSON object is rejected as `unsupported_parameter`. Recorded in TRD.md.
+- The first allow-list fixture `backend/fixtures/allowlist-2026.11.10-1.json` (32 routes, from Decision.md §4.1) uses Bedrock model identifiers and Azure model versions that are assumptions `[A]`; three Azure versions are unknown and marked `assumed-1`. It is a synthetic draft, not an approved version.
 
 ## 3. Traceability of must-haves
 
@@ -148,23 +205,23 @@ Single home of the 22 production risks. Other files cite the ID only. Tests are 
 
 | ID | Risk | Impact on this product's buyer and data | Proposed prevention | Detection signal | Test and expected outcome | Task |
 |---|---|---|---|---|---|---|
-| R-01 | Out-of-order or duplicate events overwrite a newer job state | A late "match" result from the verifier reactivates a route already suspended for a US destination; requests resume and the report says Canada | Suspension and verification updates apply only if `checked_at` is newer; request states change by compare-and-set | Count of ignored stale results; any route moving `suspended` → `active` without an operator audit event | UT-06: late match after mismatch → stays suspended. UT-05: illegal transitions refused | T-4.1.5 |
-| R-02 | A caller timeout prevents reconciliation with a valid later completion | The vendor's app times out, the provider still answers; the row stays `forwarding` and the report cannot say whether the request was served | Sweeper marks `unknown_outcome`; late completion may update it and stamps `reconciled_at`; report counts unknowns separately | Share of `unknown_outcome` rows (M-7) | IT-09: unknown, then completed with `reconciled_at` | T-3.1.7 |
-| R-03 | New utilities duplicate behaviour already owned by shared code | A second, slightly different Region parser or eligibility check in the worker disagrees with the gateway; a route is "verified" by one and "eligible" by the other on different grounds | One implementation in `core`; review rule; import-boundary check | Two functions with the same purpose found in review | UT-01 and UT-10 are the only tests of those functions; a duplicate has no test and fails coverage gate | T-2.1.1 |
-| R-04 | Applications import private code across architectural boundaries | `console` imports the gateway's forward function to "test a connection" and sends a real prompt outside the audited path | `gateway`, `console`, `worker` import only `core`; connection tests use configuration reads, never inference | Boundary check failure in the pipeline | Deliberate cross-import fails the check | T-2.1.1 |
-| R-05 | Tenant enforcement is scattered or bypassed through APIs, workers, caches, or files | One vendor sees another vendor's request volumes, model choices or report: commercially sensitive and a breach to disclose | Row-level security in the database; tenant set once in `core.tenancy`; tenant-prefixed object keys; no shared cache | Queries returning zero rows where the application expected some; 404 counts on foreign IDs | IT-08: B on A's IDs → 404; job for A reads B → zero rows | T-2.2.1 |
-| R-06 | Workers copy configuration and utility modules, causing behavioural drift | The worker keeps an older copy of the Canadian Region set after `ca-west-1` handling changes; it verifies against the wrong set | Configuration and constants only in `core.config`; no copies | Hash of the constants printed at start by each process differs | IT-18 compares the printed hash across the three processes | T-2.1.1 |
-| R-07 | Worker logging imports web-only modules and crashes during startup | The worker does not start; verification ages past its validity (1 hour for Azure, 24 for Bedrock) and every customer request is rejected; until then Azure requests are served for up to 60 minutes on configuration nobody is re-reading | `core.logging` has no web imports; worker image built without web packages | Worker health check failing; verification age rising | IT-18: worker starts in an image without web packages. IT-21 variant 3: failed checks reject at 60 minutes | T-3.1.8 |
-| R-08 | ORM declarations omit indexes or constraints present in migrations | The "one active allow-list" partial unique index is missing in a rebuilt environment; two versions are active and the decision depends on query order | Parity check between models and a migrated database | Parity check failure | IT-14: model missing an index → check fails | T-2.2.2 |
+| R-01 | Out-of-order or duplicate events overwrite a newer job state | A late "match" result from the verifier reactivates a route already suspended for a US destination; requests resume and the report says Canada | Suspension and verification updates apply only if `checked_at` is newer; request states change by compare-and-set | Count of ignored stale results; any route moving `suspended` → `active` without an operator audit event | UT-06: late match after mismatch → stays suspended. UT-05: illegal transitions refused B1 2026-11-11: UT-06 and UT-05 passed (section 2a). | T-4.1.5 |
+| R-02 | A caller timeout prevents reconciliation with a valid later completion | The vendor's app times out, the provider still answers; the row stays `forwarding` and the report cannot say whether the request was served | Sweeper marks `unknown_outcome`; late completion may update it and stamps `reconciled_at`; report counts unknowns separately | Share of `unknown_outcome` rows (M-7) | IT-09: unknown, then completed with `reconciled_at` B1 2026-11-11: IT-09 passed. | T-3.1.7 |
+| R-03 | New utilities duplicate behaviour already owned by shared code | A second, slightly different Region parser or eligibility check in the worker disagrees with the gateway; a route is "verified" by one and "eligible" by the other on different grounds | One implementation in `core`; review rule; import-boundary check | Two functions with the same purpose found in review | UT-01 and UT-10 are the only tests of those functions; a duplicate has no test and fails coverage gate B1 2026-11-11: `listed` and Region parsing exist once in `core`; `make check-imports` passes. | T-2.1.1 |
+| R-04 | Applications import private code across architectural boundaries | `console` imports the gateway's forward function to "test a connection" and sends a real prompt outside the audited path | `gateway`, `console`, `worker` import only `core`; connection tests use configuration reads, never inference | Boundary check failure in the pipeline | Deliberate cross-import fails the check B1 2026-11-11: `test_t211_deliberate_cross_import_fails_the_check` passed. | T-2.1.1 |
+| R-05 | Tenant enforcement is scattered or bypassed through APIs, workers, caches, or files | One vendor sees another vendor's request volumes, model choices or report: commercially sensitive and a breach to disclose | Row-level security in the database; tenant set once in `core.tenancy`; tenant-prefixed object keys; no shared cache | Queries returning zero rows where the application expected some; 404 counts on foreign IDs | IT-08: B on A's IDs → 404; job for A reads B → zero rows B1 2026-11-11: IT-08 passed for rows, API and job (files Not run). | T-2.2.1 |
+| R-06 | Workers copy configuration and utility modules, causing behavioural drift | The worker keeps an older copy of the Canadian Region set after `ca-west-1` handling changes; it verifies against the wrong set | Configuration and constants only in `core.config`; no copies | Hash of the constants printed at start by each process differs | IT-18 compares the printed hash across the three processes B1 2026-11-11: IT-18 hash comparison passed. | T-2.1.1 |
+| R-07 | Worker logging imports web-only modules and crashes during startup | The worker does not start; verification ages past its validity (1 hour for Azure, 24 for Bedrock) and every customer request is rejected; until then Azure requests are served for up to 60 minutes on configuration nobody is re-reading | `core.logging` has no web imports; worker image built without web packages | Worker health check failing; verification age rising | IT-18: worker starts in an image without web packages. IT-21 variant 3: failed checks reject at 60 minutes B1 2026-11-11: worker import without web packages and IT-21 variant 3 passed (image build Not run). | T-3.1.8 |
+| R-08 | ORM declarations omit indexes or constraints present in migrations | The "one active allow-list" partial unique index is missing in a rebuilt environment; two versions are active and the decision depends on query order | Parity check between models and a migrated database | Parity check failure | IT-14: model missing an index → check fails B1 2026-11-11: IT-14 parity part passed. | T-2.2.2 |
 | R-09 | Interrupted migrations or backfills cannot resume safely | A backfill of `allowlist_version` on old log rows stops halfway; reports for that month cite no version for some rows | Backfills separate, batched, with a progress row | Progress row not at end; null counts | IT-14: killed backfill resumes and finishes | T-2.2.3 |
 | R-10 | Merged branches introduce conflicting migration order | Two branches both add a `request_log` column; production and staging differ and a deploy fails mid-traffic, causing `audit_unavailable` rejections | Linear history check; rebase rule | Two heads detected | IT-14: two heads → pipeline fails | T-2.2.3 |
 | R-11 | Index creation locks busy production tables during deployment | An index build locks `request_log`; audit inserts block; every request is rejected for the duration | Concurrent builds, lock timeout, retry; lint rule | Lock wait metric; `audit_unavailable` spike during deploy | IT-14: non-concurrent index on a large table → lint fails | T-2.2.3 |
-| R-12 | Correlation IDs disappear across jobs and retries, or sensitive data leaks into logs | A prompt containing a patient's details or an Azure key is written to application logs, contradicting the product's central statement; or an incident cannot be traced from alert to request | Field allow-list in `core.logging`; request ID as correlation ID carried into jobs; provider error text dropped | Canary scan hits; log lines without correlation ID | UT-07; IT-06: zero canary hits in database, logs, bucket and restored backup | T-3.1.8 |
+| R-12 | Correlation IDs disappear across jobs and retries, or sensitive data leaks into logs | A prompt containing a patient's details or an Azure key is written to application logs, contradicting the product's central statement; or an incident cannot be traced from alert to request | Field allow-list in `core.logging`; request ID as correlation ID carried into jobs; provider error text dropped | Canary scan hits; log lines without correlation ID | UT-07; IT-06: zero canary hits in database, logs, bucket and restored backup B1 2026-11-11: UT-07 passed; IT-06 passed for database and logs only. | T-3.1.8 |
 | R-13 | Upload keys collide or fail to isolate tenant, source, and purpose | No user uploads exist. The risk applies to generated reports and exports: one vendor's report overwrites or is served as another's | Keys built by one function: tenant, kind, period, identifier | Object count per tenant against report rows | UT-11: key starts with tenant ID; two tenants, same period → different keys | T-5.1.7 |
 | R-14 | Temporary uploads survive retention expiry or failed cleanup | No uploads. Export files of request logs outlive their 7 days or survive a tenant's deletion | Expiry rule on the bucket prefix and a purge job; deletion drops the prefix | Objects older than 7 days under the export prefix | IT-15: export files gone after purge and after deletion | T-5.1.6 |
 | R-15 | Missing persistent volumes cause data loss after service recreation | Not applicable to the proposed design: containers hold no state. It would apply if the gateway moved to the founder's VPS with a local database, where recreating the service could lose the request log that reports depend on | State only in managed database, bucket and key service | Any container writing to local disk | IT-13 restore drill; IT-18 runs containers with read-only file systems | T-2.1.3 |
 | R-16 | Generated file links use internal hosts or `localhost` behind a public proxy | A reviewer's report link or an alert email points to an internal address and cannot be opened; the report is not delivered before a questionnaire deadline | Links built from one configured public base URL; signed, 5-minute | Link check; 4xx on report downloads | UT-11: link uses the public host when an internal host is configured | T-5.1.7 |
-| R-17 | Local dependencies and workers lack a reliable single startup command and health checks | A developer tests the gateway without the worker; verification never runs locally and the fail-closed paths go untested | One command starts everything with readiness checks | Health summary | IT-18 on a clean machine | T-2.1.2 |
+| R-17 | Local dependencies and workers lack a reliable single startup command and health checks | A developer tests the gateway without the worker; verification never runs locally and the fail-closed paths go untested | One command starts everything with readiness checks | Health summary | IT-18 on a clean machine B1 2026-11-11: `make smoke` green; IT-18 partly. | T-2.1.2 |
 | R-18 | Browser Back, refresh, or deep links lose the user's result or task state | An engineer refreshes after creating a key and expects to see it again; or a reviewer's saved link to a filtered log opens unfiltered and is attached to a questionnaire | Filters in the URL; show-once is explicit; forms idempotent | Support questions; duplicate records | E2E-05 | T-6.1.7 |
 | R-19 | Bulk processing skips files, hides partial failures, or duplicates successful work on retry | Reconciliation skips one hour of CloudTrail events and the report says every request matched; or a retried report double-counts | Idempotent jobs keyed by connection and hour; unmatched rows stay "not yet matched"; report totals must equal log totals or the run fails | Unmatched count; hours without a completed job | IT-11: failed page reported and retried, no double counts. IT-16: second run identical | T-5.1.5 |
 | R-20 | Unclear labels, icons, stale routes, or broken links misdirect users | A status chip reading "OK" is taken as confirmation of location; a privacy lead cites it | Fixed vocabulary and grade badges; label list reviewed against the design brief | Link check; wording review | E2E-07: no dead links; labels match the inventory | T-6.1.7 |

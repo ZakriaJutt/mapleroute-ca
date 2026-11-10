@@ -2,7 +2,7 @@
 
 Canonical instructions for any agent or developer working in this repository. [CLAUDE.md](CLAUDE.md) adds product-specific guidance and defers to this file.
 
-**State of the repository:** ten planning documents. No application exists. Every command named in any file is **proposed** until an implementation creates it; do not report a command as run unless you ran it and it exists.
+**State of the repository:** ten planning documents plus build milestone B1 (branch `feat/b1-foundation`, 2026-11-11): `backend/` holds the deterministic core (allow-list, `forwardable`, verification, request log, tenancy), a gateway, a minimal console API and a worker, all against in-memory fakes for AWS, Azure, KMS, alerting and sign-in. No real provider integration, sign-in, report, deployment or infrastructure exists. The owner's authorisation to build before T-0.6.1, and what was tested, are in [verification-report-fixing.md](verification-report-fixing.md#2a-build-milestone-b1-2026-11-11). Every command not marked "exists" below is **proposed**; do not report a command as run unless you ran it and it exists.
 
 ## Reading order
 
@@ -51,6 +51,41 @@ State each fact once and cite it by ID elsewhere. Do not restate a risk; cite `R
 
 Before writing a helper, search `core`. Region parsing, key hashing, object keys, public links, logging and tenancy each have exactly one implementation.
 
+### Utilities index (`backend/core`, B1)
+
+| Need | Module | Notes |
+|---|---|---|
+| Configuration, Canadian Region set, classes, validity, intervals, constants hash | `core.config` | The only place environment variables are read |
+| Route key, eligibility rule `listed`, canonical serialisation, hash, publish check | `core.allowlist` | Pure |
+| `forwardable` and the sealed `Decision` | `core.eligibility` | Only `evaluate` builds a `Decision` |
+| Publish, approve, activate, load the active version | `core.policy_store` | Versions never edited |
+| Error codes, HTTP status, `forwarded` flag, messages | `core.errors` | Matches [TRD.md](TRD.md#error-contract) |
+| Request log insert, transitions, sweep | `core.requestlog` | Compare-and-set; trigger enforces the same |
+| Verification checks and applying one outcome per mismatch kind | `core.verification` | |
+| Azure route-line figures and wording | `core.window` | |
+| Tenant context | `core.tenancy` | Transaction-local setting |
+| Structured logging, field allow-list, correlation ID | `core.logging` | No web imports |
+| Key generation and hashing | `core.keys` | |
+| Envelope encryption, key service interface | `core.crypto` | Fake key service only |
+| Secret wrapper that never prints | `core.secretvalue` | |
+| Bedrock ARN Region parsing | `core.regions` | |
+| Provider interfaces | `core.providers` | |
+| Fakes for every provider interface | `core.fakes` | Tests and local start only |
+| Alerts with de-duplication; pager interface | `core.alerts` | |
+| Job table enqueue, claim, retry | `core.jobs` | |
+| Audit events | `core.audit` | |
+| Clock | `core.clock` | Tests set it |
+
+### Commands
+
+| Command | Status |
+|---|---|
+| `make dev` (migrate dev database, start gateway :8110, console :3110, worker; health summary) | Exists (B1); runs processes directly, no Compose |
+| `make smoke`, `make test`, `make lint`, `make typecheck`, `make check-imports`, `make orm-parity`, `make check` | Exist (B1) |
+| `tools/orm_parity` (`python -m tools.orm_parity`) | Exists (B1) |
+| `tools/check_imports`, `tools/db_bootstrap`, `tools/dev` | Exist (B1) |
+| `tools/check_migrations`, `tools/canary_scan`, `tools/publish_allowlist`, `tools/restore_drill`, `tools/link_check` | Proposed |
+
 ## Tenant safety
 
 - Every tenant table carries `tenant_id` and a row-level security policy.
@@ -73,7 +108,7 @@ One linear history. Schema changes and backfills are separate. Indexes on large 
 
 - `main` is protected; work on short-lived branches named `type/short-topic`; releases are tags (R-22).
 - Never commit credentials, tokens, account IDs of real customers or real questionnaires.
-- This planning repository contains exactly ten root files. Scratch files, checkers and briefs stay outside it.
+- The root holds the ten planning documents plus `.gitignore`, `Makefile` and `backend/` (B1). Scratch files, checkers and briefs stay outside it.
 - Do not rewrite history on shared branches.
 
 ## What to update when something changes

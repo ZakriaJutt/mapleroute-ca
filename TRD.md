@@ -14,7 +14,7 @@ A deterministic policy proxy with a console and a report generator. Quality goal
 - All MapleRoute compute, data, backups and logs in AWS `ca-central-1` `[C]`. The founder's VPS is not in the data path (AD-09).
 - Customers bring their own Bedrock and Azure accounts `[C]`.
 - No AI function. Eligibility, access, usage counts and report totals are deterministic.
-- Planning repository: no code, scripts or infrastructure files exist.
+- Build milestone B1 (2026-11-11) added `backend/` with the deterministic core and fakes for every provider; infrastructure files still do not exist ([verification-report-fixing.md](verification-report-fixing.md#2a-build-milestone-b1-2026-11-11)).
 
 ## 3. Context and scope
 
@@ -254,9 +254,9 @@ OpenAI-style body: `{"error": {"type", "code", "message", "param", "request_id",
 | HTTP | `code` | When | Forwarded |
 |---|---|---|---|
 | 401 | `invalid_api_key` | Key unknown, revoked or malformed | false |
-| 400 | `unsupported_parameter` | Stateful or storage features such as `store: true`, files, batch | false |
+| 400 | `unsupported_parameter` | Stateful or storage features such as `store: true`, files, batch; a body that is not a JSON object | false |
 | 403 | `route_not_eligible` | No route is bound for the alias, or the bound route is not on the active allow-list | false |
-| 403 | `route_unverified` | Binding not verified, `config_mismatch`, or last matching check older than the validity period (24 h Bedrock, 1 h Azure) | false |
+| 403 | `route_unverified` | Binding not verified, `config_mismatch`, or last matching check older than the validity period (24 h Bedrock, 1 h Azure); the connection's credential cannot be obtained (role assumption or secret decryption failed) | false |
 | 503 | `route_suspended` | `definition_mismatch` or operator suspension | false |
 | 503 | `policy_unavailable` | Allow-list missing, unreadable or hash mismatch | false |
 | 503 | `audit_unavailable` | Request log insert failed | false |

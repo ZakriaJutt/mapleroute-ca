@@ -2,7 +2,7 @@
 
 **Question this file answers:** what data exists, who owns it, and how does it change?
 
-PostgreSQL 16. Proposed; no migration exists. Requirements: [PRD.md](PRD.md#must-haves). Runtime rules: [TRD.md](TRD.md). There is **no table or column for prompt or response content**, by design (AD-05).
+PostgreSQL 16. Build milestone B1 (2026-11-11) implemented the tables the core needs in `backend/migrations/sql/0001_core.sql` (models in `backend/core/models.py`); the remaining tables are still proposed. B1 deviations are listed in [verification-report-fixing.md](verification-report-fixing.md#2a-build-milestone-b1-2026-11-11). Requirements: [PRD.md](PRD.md#must-haves). Runtime rules: [TRD.md](TRD.md). There is **no table or column for prompt or response content**, by design (AD-05).
 
 ## Entity-relationship diagram
 
@@ -118,6 +118,7 @@ erDiagram
 | | `l2_confirmed_at` | timestamptz | yes | `status = 'verified'` requires it not null (check) |
 | | `provider_modified_at` | timestamptz | yes | Azure deployment's last-modified time at the last matching check |
 | `verification` T | `binding_id` | uuid | no | append-only |
+| | `route_id` | text | no | references `route`; the route compared at this check (added in B1 so the resume rule reads matches per route) |
 | | `checked_at` | timestamptz | no | — |
 | | `result` | text | no | check in (`match`, `config_mismatch`, `definition_mismatch`, `access_failed`, `error`). `config_mismatch` changes one binding; `definition_mismatch` changes `route.global_status` |
 | | `reason` | text | yes | e.g. `sku_not_eligible`, `deployment_recreated`, `l2_missing`, `role_too_broad`, `logging_outside_canada`, `destinations_differ` |
@@ -127,7 +128,7 @@ erDiagram
 
 ### request_log
 
-T. Partitioned by month on `received_at`.
+T. Partitioned by month on `received_at`. The primary key is (`id`, `received_at`) because PostgreSQL requires the partition key in it; `id` alone stays the request and correlation ID.
 
 | Field | Type | Null | Default / constraint |
 |---|---|---|---|
@@ -191,6 +192,7 @@ Check: `state <> 'rejected'` requires `route_id` and `allowlist_version`. Allowe
 | `alert (tenant_id, created_at desc) where acknowledged_at is null` | S-09 open alerts |
 | `job (run_after) where state = 'queued'` | Worker claim with `FOR UPDATE SKIP LOCKED` |
 | `binding (route_id)` | Tenants affected by a route suspension (operator role) |
+| `verification (route_id, checked_at) where result = 'match'` partial | Resume rule: a match newer than the suspension (added in B1) |
 
 ## Roles and permissions
 
@@ -201,6 +203,8 @@ Check: `state <> 'rejected'` requires `route_id` and `allowlist_version`. Allowe
 | `mr_worker` | `worker` | As needed per job, tenant set per job; insert `verification`, `region_observation`, `logging_observation`, `report`, `alert`; update `binding.status`, `route.global_status` (to `suspended` only) and `request_log.flags` |
 | `mr_operator` | `console` on `/ops` routes | Write `allowlist_version` drafts, approve, `route.global_status`, register tables; read tenant names and aggregate counts through views; no grant on `connection_secret`. These are application roles; the database owner and the cloud administrator, the same person today, sit above them |
 | `mr_migrate` | Migration task | DDL; not used at runtime |
+
+**Narrow cross-tenant functions (B1).** `resolve_api_key(hash)` returns key ID, tenant, project and state for one hash, because the gateway learns the tenant from the key; `tenants_bound_to_route(route)` returns tenant IDs only, for suspension alerts and the 7-day removal rule. Both run as the owner. B1 runs all three processes as one application role, `mapleroute_app`; the split above is not yet created locally.
 
 Application roles map to rights as in [PRD.md](PRD.md#users-and-roles) and are enforced in `core.authz`, with row-level security as the second barrier. **Cross-tenant denial:** a query without `app.tenant_id` returns no rows; a foreign ID returns 404; `mr_gateway` cannot list tenants.
 
