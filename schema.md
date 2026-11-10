@@ -204,7 +204,14 @@ Check: `state <> 'rejected'` requires `route_id` and `allowlist_version`. Allowe
 | `mr_operator` | `console` on `/ops` routes | Write `allowlist_version` drafts, approve, `route.global_status`, register tables; read tenant names and aggregate counts through views; no grant on `connection_secret`. These are application roles; the database owner and the cloud administrator, the same person today, sit above them |
 | `mr_migrate` | Migration task | DDL; not used at runtime |
 
-**Narrow cross-tenant functions (B1).** `resolve_api_key(hash)` returns key ID, tenant, project and state for one hash, because the gateway learns the tenant from the key; `tenants_bound_to_route(route)` returns tenant IDs only, for suspension alerts and the 7-day removal rule. Both run as the owner. B1 runs all three processes as one application role, `mapleroute_app`; the split above is not yet created locally.
+**As built (B1, fix round 1, migration `0003_process_roles`).** Local role names carry the product prefix because roles are cluster-wide: `mapleroute_gateway` (`mr_gateway`), `mapleroute_console` (`mr_console`), `mapleroute_worker` (`mr_worker`), `mapleroute_operator` (`mr_operator`). All are NOSUPERUSER NOBYPASSRLS; migrations run as the database owner (`mr_migrate`). Grants are column-level where the table above names columns: the gateway has no grant on `tenant`, `user_account`, `job` or `verification`, cannot update `binding`, and updates only the completion columns of `request_log`; the console inserts only the identifying columns of `binding` and cannot select `connection_secret.ciphertext` or `wrapped_data_key`; the worker selects only `tenant.id` and `tenant.state`, and can set `route.global_status` to `suspended` but not back. The console's `/ops` routes connect as the operator role. The B1 single role `mapleroute_app` is NOLOGIN with no privileges. `mr_operator` tenant-name views are not built.
+
+**SECURITY DEFINER functions (three).** All are owned by `mapleroute_definer` (NOLOGIN, NOSUPERUSER, NOBYPASSRLS; it reads through `FOR SELECT TO mapleroute_definer` policies on exactly the columns it needs), set `search_path = pg_catalog, public, pg_temp` (temporary schema last), qualify every relation with `public.`, and are not executable by PUBLIC:
+- `resolve_api_key(hash)`: key ID, tenant, project and state for one hash, because the gateway learns the tenant from the key. Executable by the gateway only.
+- `tenants_bound_to_route(route)`: tenant IDs only, for suspension alerts and the 7-day removal rule. Executable by the worker and operator.
+- `route_resume_guard()`: the trigger on `route`. Refuses `suspended` → `active` unless the session user is the operator role **and** a `verification` row with `result = 'match'` newer than the suspension exists for that route.
+
+`verification` carries a composite foreign key (`tenant_id`, `binding_id`, `route_id`) to `binding` (`tenant_id`, `id`, `route_id`), so a check can only be recorded against its binding's route.
 
 Application roles map to rights as in [PRD.md](PRD.md#users-and-roles) and are enforced in `core.authz`, with row-level security as the second barrier. **Cross-tenant denial:** a query without `app.tenant_id` returns no rows; a foreign ID returns 404; `mr_gateway` cannot list tenants.
 
@@ -222,8 +229,9 @@ Application roles map to rights as in [PRD.md](PRD.md#users-and-roles) and are e
 | Request decision | Insert `request_log` in its own committed transaction before forwarding | One row per request ID |
 | Completion | Single update with `where state = 'forwarding'` | Second writer changes nothing |
 | Publish allow-list | One transaction: validate, set previous `superseded`, set new `active`, write `allowlist_route`, audit | Partial unique index refuses two active |
-| Suspend route (`definition_mismatch`) | Update with `where status_checked_at < :checked_at` | Older result ignored |
-| Un-verify binding (`config_mismatch`) | Update that binding with `where last_checked_at < :checked_at`; flag its requests since the last matching check | Older result ignored; flagging is idempotent |
+| Verify binding (`match`) | Under the binding lock, update that binding only if `checked_at` (end of the reads) is later than `last_checked_at`; `last_verified_at` is the start of the reads | Older match recorded, never applied (R-01) |
+| Suspend route (`definition_mismatch`) | Update `where global_status = 'active'`, however late the result | Suspending is never unsafe; only resume is guarded |
+| Un-verify binding (`config_mismatch`) | Under the binding lock, always set `unverified`; flag every served request of the binding since `last_verified_at` (the start of the last matching check's reads), with no upper bound | Never discarded as late (B1-003); flagging is idempotent |
 | Console mutations | Transaction plus `form_token` | Second submit returns first result |
 | Jobs | Unique (`kind`, `dedupe_key`) | Re-enqueue is a no-op |
 | Reconciliation | Upsert on `provider_event_id` | Replay-safe |

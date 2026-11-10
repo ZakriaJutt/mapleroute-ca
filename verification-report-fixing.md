@@ -39,7 +39,7 @@ All **Not run**.
 | Verification, mismatch kinds and suspension | UT-06, UT-10, IT-05, IT-10 | UT-06, UT-10, IT-05 passed on fakes; IT-10 partly (alert rows, no delivery) |
 | Customer-side policy, Azure change window, customer logging state | IT-21, IT-22 | Passed on fakes (three IT-21 variants); not on real accounts (T-6.1.1) |
 | Sign-in, identity and operator access | UT-13 | Not run |
-| No content or credential persistence | UT-07, IT-06, IT-07 | UT-07 passed; IT-06 partly (database and application logs; bucket and restored backup Not run); IT-07 Not run |
+| No content or credential persistence | UT-07, IT-06, IT-07 | UT-07 passed; IT-06 partly (database, application and server logs; bucket and restored backup Not run); IT-07 partly since fix round 1 (ciphertext refused to the console role; KMS decrypt Not run) |
 | Tenant isolation and roles | UT-12, IT-08 | IT-08 passed (rows, API, job; no files exist yet); UT-12 Not run |
 | Request state and timeouts | UT-05, IT-09 | Passed |
 | Report and register | UT-08, IT-16 | Not run |
@@ -67,10 +67,10 @@ All **Not run**.
 
 | Command | Result |
 |---|---|
-| `make test` (drops and re-migrates `mapleroute_test`, then `pytest`) | 72 passed, 0 failed |
+| `make test` (drops and re-migrates `mapleroute_test`, then `pytest`) | 72 passed, 0 failed at hand-off; **96 passed, 0 failed** after fix round 1 |
 | `make orm-parity` | `orm parity: OK` |
 | `make lint` (ruff 0.8.6) | All checks passed |
-| `make typecheck` (mypy 1.13, strict, 47 files incl. tests) | No issues |
+| `make typecheck` (mypy 1.13, strict, incl. tests) | No issues (47 files; 49 after fix round 1) |
 | `make check-imports` | `import boundaries: OK` |
 | `make smoke` (migrate dev, start gateway :8110, console :3110, worker, health summary, stop) | Three services ok, same constants hash; exit 0 |
 
@@ -91,7 +91,7 @@ All **Not run**.
 | IT-03 | `test_it03_fifty_ineligible_inputs_zero_outbound_calls` | Passed | 50 inputs plus a malformed body; stub recorded zero calls; 51 `rejected` rows |
 | IT-04 | `test_it04_database_down_rejects_audit_unavailable`, `test_it04_log_insert_failure_rejects_audit_unavailable` | Passed | Unreachable database, and insert privilege revoked |
 | IT-05 | `test_it05a_*`, `test_it05b_*`, `test_it05c_*`, `test_it05d_*` | Passed | Fakes |
-| IT-06 | `test_canary_and_boundaries.py::test_it06_canaries_never_reach_database_or_logs` | Passed, partly | Every table and the application log stream scanned; bucket and restored backup Not run (none exist) |
+| IT-06 | `test_canary_and_boundaries.py::test_it06_canaries_never_reach_database_or_logs`; fix round 1: `test_b1_006_adapter_exception_text_reaches_no_log` | Passed, partly | Every table, the application log stream and (round 1) server stdout/stderr scanned; bucket and restored backup Not run (none exist) |
 | IT-08 | `test_it08_no_tenant_context_reads_zero_rows`, `test_it08_job_for_a_reads_zero_rows_of_b`, `test_it08_b_session_and_key_on_a_ids_get_404` | Passed | No files exist yet, so the file part is Not run |
 | IT-09 | `test_it09_sweeper_then_late_completion_reconciles` | Passed | — |
 | IT-10 | `test_it10_suspension_alerts_every_bound_tenant_once` | Passed, partly | Alert rows de-duplicated; delivery and the 5-minute bound Not run |
@@ -102,15 +102,42 @@ All **Not run**.
 
 All other tests in [execution-plan.md](execution-plan.md#planned-tests) remain **Not run**.
 
-**Blocked, with reason.** T-6.1.1 and every real-account half of IT-03/IT-21 (no AWS or Azure test accounts in B1); T-3.1.4 and T-3.1.5 real adapters and the LiteLLM pin (no accounts; O-11 unverified); T-2.1.3, T-2.1.4, IT-20 (no AWS account, no deployment in scope); T-4.1.1, T-4.1.2, UT-12, UT-13 (OIDC needs registered identity-provider applications); IT-07 (needs the per-process database roles, see deviations); T-5.1.x, T-5.2.1 (reports, watcher, reconciliation, billing need real data sources or Stripe); T-1.1.3 Azure header check (needs a test deployment).
+**Blocked, with reason.** T-6.1.1 and every real-account half of IT-03/IT-21 (no AWS or Azure test accounts in B1); T-3.1.4 and T-3.1.5 real adapters and the LiteLLM pin (no accounts; O-11 unverified); T-2.1.3, T-2.1.4, IT-20 (no AWS account, no deployment in scope); T-4.1.1, T-4.1.2, UT-12, UT-13 (OIDC needs registered identity-provider applications); IT-07 decrypt half (needs a real KMS key policy; the role half runs since fix round 1); T-5.1.x, T-5.2.1 (reports, watcher, reconciliation, billing need real data sources or Stripe); T-1.1.3 Azure header check (needs a test deployment).
 
 **Deviations from the documents, recorded.**
-- One application role `mapleroute_app` serves all three processes (environment rule for B1). The per-process roles `mr_gateway`, `mr_console`, `mr_worker`, `mr_operator` of [schema.md](schema.md#roles-and-permissions) are not created, so the split encrypt/decrypt and the "console cannot select ciphertext" control are not in force locally.
-- `verification.route_id` added (the route compared at that check), so the resume trigger can find a newer match for a route without joining through a binding that may be re-bound. Index `ix_verification_route_match` added. Recorded in schema.md.
+- ~~One application role `mapleroute_app` for all three processes~~: replaced in fix round 1 (B1-005) by the per-process roles; see [schema.md](schema.md#roles-and-permissions) "As built". Local names carry the `mapleroute_` prefix because roles are cluster-wide.
+- `verification.route_id` added (the route compared at that check), so the resume trigger can find a newer match for a route without joining through a binding that may be re-bound. Index `ix_verification_route_match` added. Recorded in schema.md. Fix round 1: a composite foreign key ties it to the binding's route (B1-005).
 - `request_log` primary key is (`id`, `received_at`) because PostgreSQL requires the partition key in it; one DEFAULT partition only; monthly partition creation is not built.
-- Two narrow `SECURITY DEFINER` functions: `resolve_api_key` (the key lookup runs before the tenant is known) and `tenants_bound_to_route` (tenant IDs only, for suspension fan-out and the 7-day removal rule). Recorded in schema.md.
+- Three `SECURITY DEFINER` functions: `resolve_api_key`, `tenants_bound_to_route` and the trigger function `route_resume_guard` (the round-0 text said two; B1-011). Since fix round 1 all three are owned by the non-superuser NOLOGIN role `mapleroute_definer`, use `search_path = pg_catalog, public, pg_temp` with qualified names, and are not executable by PUBLIC (B1-004). Recorded in schema.md.
 - Error contract: a request whose credential cannot be obtained (AWS role assumption or Azure secret decryption fails) is rejected as `route_unverified`, not forwarded; a body that is not a JSON object is rejected as `unsupported_parameter`. Recorded in TRD.md.
 - The first allow-list fixture `backend/fixtures/allowlist-2026.11.10-1.json` (32 routes, from Decision.md §4.1) uses Bedrock model identifiers and Azure model versions that are assumptions `[A]`; three Azure versions are unknown and marked `assumed-1`. It is a synthetic draft, not an approved version.
+
+### B1 fix round 1 (2026-11-11)
+
+Independent code review `mapleroute-ca-b1-round1.md`: 0 blocker, 6 major, 5 minor. Fixes are the author's; retest verdicts are the reviewer's and are not set here. Regression tests: `backend/tests/test_round1_regressions.py` (each reproduces the reviewer's adversarial case) and two tests in `test_unit_core.py`.
+
+| Finding | Fix | Regression test(s) | Status |
+|---|---|---|---|
+| B1-001 | `checked_at` is the end of the provider reads; `last_verified_at` is the start of the matching check's reads; a mismatch flags every served request since then with no upper bound; the worker applies under an exclusive per-binding advisory lock that the gateway takes shared while it decides and commits | `test_b1_001_request_served_during_the_check_reads_is_flagged`, `test_b1_003_gateway_waits_for_a_mismatch_being_applied` | Fixed, awaiting retest |
+| B1-002 | Activity look-back starts at the start of the reads of the last check whose reads completed (`match`, `config_mismatch`, `definition_mismatch`); failed checks never move it | `test_b1_002_failed_check_never_moves_the_activity_lookback` (1 and 2 failed checks) | Fixed, awaiting retest |
+| B1-003 | Reads first, then the binding lock, then the decision; a mismatch is always applied (binding un-verified, route suspended) however late; only a late match is discarded | `test_b1_003_later_observed_mismatch_with_earlier_stamp_is_applied`, UT-06 | Fixed, awaiting retest |
+| B1-004 | Migration `0003`: the three SECURITY DEFINER functions are owned by `mapleroute_definer`, use `search_path = pg_catalog, public, pg_temp` and `public.`-qualified names, and have no PUBLIC execute; the resume guard also requires the operator role | `test_b1_004_temp_table_cannot_shadow_verification_in_resume_guard` (as each of the four roles), `test_b1_004_only_the_operator_resumes` | Fixed, awaiting retest |
+| B1-005 | Roles `mapleroute_gateway`, `_console`, `_worker`, `_operator` with column-level least privilege; `mapleroute_app` retired; `verification` tied to the binding's route by a composite foreign key | `test_b1_005_gateway_role_cannot_list_tenants_users_or_forge_verification`, `test_b1_005_console_cannot_mark_verified_or_read_ciphertext_it07`, `test_b1_005_worker_reads_tenant_ids_but_not_names`, `test_b1_005_verification_route_must_be_the_bindings_route`; IT-08 now runs per role | Fixed, awaiting retest |
+| B1-006 | Any adapter exception after the commit becomes `upstream_error` (502), logged by class only; mid-stream failures end the stream; an ASGI layer turns any escaped exception into a generic 500 without re-raising; uvicorn loggers carry a filter that withholds message arguments and tracebacks, and run with `log_config=None` | `test_b1_006_adapter_exception_text_reaches_no_log` (real uvicorn; scans the response, the `core.logging` stream, the root logger, stdout and stderr), `test_b1_006_unhandled_exception_becomes_generic_500` | Fixed, awaiting retest |
+| B1-007 | The evaluator's capability is exchanged for an HMAC over every field; `dataclasses.replace` or any field change gives an unsealed object that `forward()` refuses | `test_b1_007_replace_on_a_sealed_decision_unseals_it` | Fixed, awaiting retest |
+| B1-008 | `model` longer than 128 characters is rejected `route_not_eligible` | `test_b1_008_overlong_model_is_rejected_not_served` | Fixed, awaiting retest |
+| B1-009 | `forward()` passes adapters only allow-listed fields per endpoint and sets `model` to the Decision's identifier | `test_b1_009_adapter_receives_only_validated_fields` | Fixed; recheck when T-3.1.4/5 adapters land |
+| B1-010 | Idempotency token stored as method, path and key; malformed `connection_id` gives 422 | `test_b1_010_idempotency_key_is_scoped_to_the_endpoint`, `test_b1_010_malformed_ids_are_4xx` | Fixed, awaiting retest |
+| B1-011 | Documents list all three functions with owner and search_path | — | Fixed, awaiting retest |
+
+**IT-07** now runs in part: the console role is refused `SELECT ciphertext` and `SELECT wrapped_data_key` on `connection_secret` (passed). The "decrypt denied" half needs the real KMS key policy: **Not run**.
+
+**Commands after the fixes** (from `mapleroute-ca/`): `make check` (ruff: all checks passed; mypy strict: no issues in 49 files; `import boundaries: OK`; `make test` on a re-migrated `mapleroute_test`: **96 passed, 0 failed**; `orm parity: OK`); `make smoke`: three services ok, exit 0.
+
+**Reviewer's adversarial script**, run unchanged (`PYTHONPATH=. .venv/bin/pytest -p tests.conftest -c pyproject.toml --rootdir . -q ../../_coordination/review/mapleroute-ca-b1-adversarial.py` from `backend/`): before the fixes 3 passed, 8 failed; after, **8 passed** (A1, A2, A2b, A3, A4, A5, A6, A7) and **3 failed**, each failing on a statement the new roles now refuse:
+- A8 stops at `permission denied for table tenant`: the gateway role can no longer read `tenant`. The case's own assertion expects the read to succeed with at most one row.
+- A10 stops at `permission denied for function tenants_bound_to_route`: the gateway role is no longer allowed to call it. Its assertions on `resolve_api_key` still hold.
+- A9 wires the gateway to `world.app`, which in the test harness is now the worker role. The worker cannot call `resolve_api_key`, so the request is refused before it reaches the adapter. It also asserts HTTP 500, but the error contract answers `upstream_error` 502. A copy of the script kept outside the repository, with only those two lines changed (the gateway's session factory, and 502), passes A9: no canary in the response, the uvicorn error log or the row (`upstream_error`). The in-repo test `test_b1_006_*` covers the same case.
 
 ## 3. Traceability of must-haves
 

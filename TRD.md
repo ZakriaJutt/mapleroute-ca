@@ -159,7 +159,7 @@ Schedule: before first use; Bedrock every 6 hours with 24-hour validity; Azure e
 | `definition_mismatch` | The provider's own definition of a shared object: a system-defined Bedrock profile whose destinations differ from the route. Bedrock only; Azure exposes no shared definition through a customer account | The **route's** `global_status` becomes `suspended`; requests get `route_suspended`; operator and all tenants bound to it are alerted | Every tenant bound to that route. Deliberate: a changed definition is wrong for all of them. A single faulty read can therefore reject traffic for all until the operator re-reads from MapleRoute's own account |
 | `access_failed`, `error` | Nothing usable | No status change; the binding ages out | One binding |
 
-A result is applied only if its `checked_at` is later than the stored one, so a late result cannot reactivate anything (R-01). A suspended route is resumed only by the operator **and** only when a `match` newer than the suspension exists for that route (F-011). Each binding is checked independently: a failure on one never stops the checks on the others, and `access_failed`, `error`, "not yet matched" and `unknown_outcome` never count as a pass anywhere, including in the report.
+`checked_at` is the end of the provider reads, and a result is decided only while the worker holds the binding lock (the gateway holds the same lock, shared, while it decides and commits a request). A `match` is applied only if its `checked_at` is later than the stored one, so a late result cannot reactivate anything (R-01); a mismatch is always applied, however late, because un-verifying or suspending is never unsafe. Requests are flagged from the start of the reads of the last matching check, with no upper bound. The Azure activity-log look-back starts at the start of the reads of the last check whose reads completed: an `access_failed` or `error` check never moves it, so a period no check read stays open until a completed check covers it. A suspended route is resumed only by the operator **and** only when a `match` newer than the suspension exists for that route (F-011). Each binding is checked independently: a failure on one never stops the checks on the others, and `access_failed`, `error`, "not yet matched" and `unknown_outcome` never count as a pass anywhere, including in the report.
 
 ### Residual window on Azure
 
@@ -255,13 +255,13 @@ OpenAI-style body: `{"error": {"type", "code", "message", "param", "request_id",
 |---|---|---|---|
 | 401 | `invalid_api_key` | Key unknown, revoked or malformed | false |
 | 400 | `unsupported_parameter` | Stateful or storage features such as `store: true`, files, batch; a body that is not a JSON object | false |
-| 403 | `route_not_eligible` | No route is bound for the alias, or the bound route is not on the active allow-list | false |
+| 403 | `route_not_eligible` | No route is bound for the alias, or the bound route is not on the active allow-list; `model` longer than 128 characters | false |
 | 403 | `route_unverified` | Binding not verified, `config_mismatch`, or last matching check older than the validity period (24 h Bedrock, 1 h Azure); the connection's credential cannot be obtained (role assumption or secret decryption failed) | false |
 | 503 | `route_suspended` | `definition_mismatch` or operator suspension | false |
 | 503 | `policy_unavailable` | Allow-list missing, unreadable or hash mismatch | false |
 | 503 | `audit_unavailable` | Request log insert failed | false |
 | 429 | `rate_limited` | Per-key limit exceeded | false |
-| 502 | `upstream_error` | Provider returned an error; provider status and error code passed on, provider message text dropped | true |
+| 502 | `upstream_error` | Provider returned an error; provider status and error code passed on, provider message text dropped. Also any other adapter exception after the log row is committed: logged by exception class only | true |
 | 504 | `upstream_timeout` | No first byte in 60 s | true |
 
 Example message for `route_not_eligible`: "No Canada-listed route is bound to model 'claude-sonnet-5-5' for this project. The request was not sent to any provider." The gateway never retries on another route and never retries upstream calls itself.
@@ -377,7 +377,7 @@ One person is on call; there is no second responder. That is an accepted gap.
 
 - **Identity.** Console users sign in through Microsoft or Google OIDC `[C]` (AD-13). No passwords and no email links. API clients use project keys. A user is identified by (identity provider, subject), never by email or email domain. **One tenant-resolution rule:** a signed-in user with no membership either creates a new tenant in S-02 and becomes its owner, or accepts an invitation; an invitation is a one-time link bound to an email address and is accepted only when the signed-in identity's verified email claim equals it, after which the membership is bound to the subject. Nobody joins a tenant because of an email domain.
 - **Operator sign-in.** `/ops` is served on a separate host, limited to the founder's Entra ID account, and requires an ID token whose `amr` claim shows multi-factor authentication `[A]` and whose authentication time is under 5 minutes old before approve, suspend or resume (re-authentication). Tenant owners may switch on the same `amr` check for their users; where an identity provider sends no such claim it cannot be checked.
-- **Tenancy.** Every tenant table has `tenant_id`; PostgreSQL row-level security reads a session setting that `core.tenancy` sets once per request or job from the authenticated context. The three processes use different database roles ([schema.md](schema.md#roles-and-permissions)). Object keys start with the tenant ID (R-05, R-13).
+- **Tenancy.** Every tenant table has `tenant_id`; PostgreSQL row-level security reads a session setting that `core.tenancy` sets once per request or job from the authenticated context. The three processes use different database roles, and the console's `/ops` routes a fourth ([schema.md](schema.md#roles-and-permissions)); the three privileged functions are owned by a non-superuser definer role with `pg_temp` last in their search path. Object keys start with the tenant ID (R-05, R-13).
 - **Logging.** Structured JSON; a correlation ID equal to the request ID travels through gateway, jobs and retries (R-12). An allow-list of loggable fields; bodies, headers named `authorization` or `api-key`, and provider error text are never passed to the logger.
 - **No content persistence (AD-05).** Request and response bodies exist only in process memory. No temp files, no body hashes, no tracing payloads, no debug switch.
 - **Threat model.**
