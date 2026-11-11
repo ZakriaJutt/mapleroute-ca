@@ -198,37 +198,49 @@ def apply_outcome(session: Session, binding: Binding, outcome: CheckOutcome, che
             )
         )
     session.flush()
-    newer = binding.last_checked_at is None or checked_at > binding.last_checked_at
-    if newer:
+    # Ordering is by observation (start of the reads), never by when a check finished (B1-012).
+    observed = started
+    behind = binding.state_observed_at
+    if binding.last_checked_at is None or checked_at > binding.last_checked_at:
         binding.last_checked_at = checked_at
     connection = session.get(ProviderConnection, binding.connection_id)
     if outcome.result == "match":
-        if not newer:
+        if behind is not None and observed <= behind:
             session.flush()
-            return Applied("match", applied=False)  # late match: recorded, never applied (R-01)
+            return Applied("match", applied=False)  # older observation: recorded, never applied (R-01)
         binding.status = "verified"
         # Validity and the next window start from the start of the reads (conservative).
-        binding.last_verified_at = started
-        binding.l2_confirmed_at = started
+        binding.last_verified_at = observed
+        binding.l2_confirmed_at = observed
+        binding.state_observed_at = observed
         binding.provider_modified_at = outcome.provider_modified_at
         if connection is not None and connection.state != "deleted":
             connection.state, connection.last_read_ok_at = "connected", checked_at
         session.flush()
         return Applied("match", True)
     if outcome.result == "config_mismatch":
-        since = binding.last_verified_at
-        binding.status = "unverified"  # always: a mismatch is never discarded as late (B1-003)
-        if newer and outcome.provider_modified_at is not None:
-            binding.provider_modified_at = outcome.provider_modified_at  # new baseline for the next check
+        verifying = binding.last_verified_at if binding.status == "verified" else None
+        # A mismatch observed at or after the observation that verified the binding always wins.
+        wins = verifying is None or observed >= verifying
+        since = prior_match_observation(session, binding.id, observed) or binding.last_verified_at
+        if wins:
+            binding.status = "unverified"
+            if behind is None or observed >= behind:
+                binding.state_observed_at = observed
+                if outcome.provider_modified_at is not None:
+                    binding.provider_modified_at = outcome.provider_modified_at  # baseline for the next check
         session.flush()
+        # Served requests are flagged either way: the deployment was seen mismatching after `since`.
         flagged = flag_window(session, binding, since) if since is not None else 0
         raised = alerts.raise_alert(
             session, binding.tenant_id, "config_mismatch", f"config_mismatch:{binding.id}:{since}",
             {"binding_id": str(binding.id), "route_id": binding.route_id, "reason": outcome.reason,
              "flagged_requests": flagged},
         )
-        return Applied("config_mismatch", True, flagged_requests=flagged, alert_raised=raised)
+        return Applied("config_mismatch", wins, flagged_requests=flagged, alert_raised=raised)
     if outcome.result == "definition_mismatch":
+        if behind is None or observed > behind:
+            binding.state_observed_at = observed  # an older match can no longer re-verify past it
         suspended = suspend_route(session, binding.route_id, checked_at, outcome.reason or "destinations_differ")
         if suspended:
             jobs.enqueue(session, "notify_route_suspended", f"{binding.route_id}:{checked_at.isoformat()}",
@@ -318,3 +330,19 @@ def lookback_start(session: Session, binding_id: uuid.UUID) -> datetime | None:
         return None
     started = (row.provider_answer or {}).get("coverage", {}).get("reads_started_at")
     return datetime.fromisoformat(started) if started else row.checked_at
+
+
+def prior_match_observation(session: Session, binding_id: uuid.UUID, before: datetime) -> datetime | None:
+    """Observation time of the latest matching check observed before ``before`` (window start)."""
+    rows = session.execute(
+        select(Verification.provider_answer, Verification.checked_at)
+        .where(Verification.binding_id == binding_id, Verification.result == "match")
+        .order_by(Verification.checked_at.desc()).limit(50)
+    ).all()
+    starts = []
+    for answer, checked in rows:
+        raw = (answer or {}).get("coverage", {}).get("reads_started_at")
+        started = datetime.fromisoformat(raw) if raw else checked
+        if started < before:
+            starts.append(started)
+    return max(starts) if starts else None

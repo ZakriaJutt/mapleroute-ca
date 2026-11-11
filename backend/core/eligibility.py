@@ -10,7 +10,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+import threading
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -21,6 +23,7 @@ from core.errors import Code
 # Clock skew tolerated for a verification stamped slightly in the future; beyond it, reject.
 MAX_FUTURE_SKEW = timedelta(seconds=60)
 
+# Kept only so older probes that pass it still import; it grants nothing since fix round 2 (B1-007).
 _SEAL = object()
 
 
@@ -67,15 +70,35 @@ class Decision:
     binding_verified_at: datetime
     _seal: object = field(repr=False, compare=False, default=None)
 
-    def __post_init__(self) -> None:
-        # Only the evaluator passes the capability; it is exchanged for a MAC over every field, so a
-        # copy made with dataclasses.replace (or any other change of a field) is no longer sealed
-        # (B1-007). Anything else constructs an unsealed object that forward() refuses.
-        if self._seal is _SEAL:
-            object.__setattr__(self, "_seal", _mac(self))
-
     def is_sealed(self) -> bool:
-        return isinstance(self._seal, bytes) and hmac.compare_digest(self._seal, _mac(self))
+        """True only for the very object ``evaluate`` issued, with its fields unchanged (B1-007).
+
+        Constructing a Decision, passing any ``_seal`` value, copying it or changing a field gives an
+        object that is not in the issue registry or whose MAC differs. Residual risk, recorded: code
+        in the same process that deliberately writes to this module's private registry can still
+        forge one; Python has no stronger in-process boundary.
+        """
+        ref = _ISSUED.get(id(self))
+        return (ref is not None and ref() is self and isinstance(self._seal, bytes)
+                and hmac.compare_digest(self._seal, _mac(self)))
+
+
+# id(decision) -> weak reference; identity, not equality, so an equal hand-built copy is not issued.
+_ISSUED: dict[int, weakref.ref[Decision]] = {}
+_ISSUED_LOCK = threading.Lock()
+
+
+def _issue(d: Decision) -> Decision:
+    object.__setattr__(d, "_seal", _mac(d))
+    key = id(d)
+
+    def _drop(_: object, key: int = key) -> None:
+        with _ISSUED_LOCK:
+            _ISSUED.pop(key, None)
+
+    with _ISSUED_LOCK:
+        _ISSUED[key] = weakref.ref(d, _drop)
+    return d
 
 
 @dataclass(frozen=True)
@@ -124,7 +147,7 @@ def evaluate(binding: BindingState | None, version: AllowlistDoc | None, now: da
         if not binding.endpoint_host or not binding.deployment_name:
             return reject(Code.ROUTE_NOT_ELIGIBLE)
         host, identifier = binding.endpoint_host, binding.deployment_name
-    return Decision(
+    return _issue(Decision(
         binding_id=binding.binding_id,
         connection_id=binding.connection_id,
         route_id=route.id,
@@ -135,5 +158,4 @@ def evaluate(binding: BindingState | None, version: AllowlistDoc | None, now: da
         allowlist_version=version.version,
         route_status=binding.route_global_status,
         binding_verified_at=verified_at,
-        _seal=_SEAL,
-    )
+    ))

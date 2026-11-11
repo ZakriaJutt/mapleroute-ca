@@ -102,7 +102,7 @@ def test_b1_007_replace_on_a_sealed_decision_unseals_it() -> None:
     """Regression (adversarial A5): a copy re-targeted with dataclasses.replace is refused."""
     d = evaluate(state(AZ), DOC, NOW)
     assert isinstance(d, Decision) and d.is_sealed()
-    assert dataclasses.replace(d).is_sealed()  # an identical copy targets the same place
+    assert not dataclasses.replace(d).is_sealed()  # round 2: only the issued object itself is sealed
     for change in ({"upstream_host": "evil-global.openai.azure.com"}, {"source_region": "eastus"},
                    {"upstream_identifier": "gpt-4o-global"}, {"route_id": "azure:x"}):
         moved = dataclasses.replace(d, **change)  # type: ignore[arg-type]

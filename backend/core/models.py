@@ -274,6 +274,8 @@ class Binding(Base):
     last_checked_at: Mapped[datetime | None] = mapped_column(TS)
     l2_confirmed_at: Mapped[datetime | None] = mapped_column(TS)
     provider_modified_at: Mapped[datetime | None] = mapped_column(TS)
+    # Start of the reads of the result behind the current state; orders results by observation (B1-012).
+    state_observed_at: Mapped[datetime | None] = mapped_column(TS)
     created_at: Mapped[datetime] = _created()
     __table_args__ = (
         ForeignKeyConstraint(

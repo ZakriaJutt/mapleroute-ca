@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import dataclasses
 import io
+import json
 import logging
 import socket
 import threading
 import time
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import httpx
 import pytest
@@ -26,7 +27,7 @@ from core.fakes import FakeInference
 from core.logging import quiet_server_loggers
 from core.models import Binding, RequestLog, Route
 from core.providers import ActivityEvent, AzureTarget, DeploymentAnswer, UpstreamRequest, UpstreamResponse
-from core.verification import resume_route
+from core.verification import Applied, resume_route
 from gateway.app import GatewayServices, RateLimiter, create_app
 from tests.helpers import CONSOLE_URL, GATEWAY_URL, GPT4O, HAIKU, OPERATOR_URL, WORKER_URL, T, World
 from worker.jobs import verify_binding
@@ -394,3 +395,152 @@ def test_b1_010_malformed_ids_are_4xx(world: World, bad: object) -> None:
                json={"connection_id": bad, "route_id": HAIKU, "alias": "haiku"})
     assert r.status_code == 422
     assert c.get("/api/projects/not-a-uuid/requests").status_code == 422
+
+
+# ========================================================================= fix round 2
+# ------------------------------------------------------------------------- B1-012 (N3)
+def test_b1_012_older_observation_match_cannot_undo_a_newer_mismatch(world: World) -> None:
+    """N3: job B observes Standard first, its last read is slow; the deployment becomes Global and job A
+    runs end to end (config_mismatch). B finishes later but observed earlier: its match is discarded."""
+    t, b = azure_setup(world)
+    gw = world.gateway()
+    world.clock.advance(minutes=15)
+    reader = world.azure_reader
+    orig = reader.get_diagnostic_logging
+    state: dict[str, object] = {"inside": False}
+
+    def slow_logging(target: AzureTarget):  # type: ignore[no-untyped-def]
+        if not state["inside"]:
+            state["inside"] = True
+            world.clock.advance(seconds=5)
+            reader.recreate(HOST, DEP, "GlobalStandard", world.clock())
+            with world.app.begin() as s2:
+                state["a"] = verify_binding(s2, world.worker_services(), t.tenant_id, b, world.clock())
+            world.clock.advance(seconds=1)
+            state["mid"] = code_of(world.chat(gw, t.key, "gpt-4o"))
+            world.clock.advance(seconds=5)
+        return orig(target)
+
+    reader.get_diagnostic_logging = slow_logging  # type: ignore[method-assign]
+    with world.app.begin() as s:
+        b_applied = verify_binding(s, world.worker_services(), t.tenant_id, b, world.clock())
+    reader.get_diagnostic_logging = orig  # type: ignore[method-assign]
+    a_applied = state["a"]
+    assert getattr(a_applied, "result", None) == "config_mismatch" and state["mid"] == "route_unverified"
+    assert b_applied.result == "match" and b_applied.applied is False
+    world.clock.advance(minutes=1)
+    assert code_of(world.chat(gw, t.key, "gpt-4o")) == "route_unverified"
+    with world.owner() as s:
+        row = s.get(Binding, b)
+        assert row is not None and row.status == "unverified"
+
+
+def test_b1_012_three_concurrent_checks_any_finish_order(world: World) -> None:
+    """Checks B and C observe Standard; the deployment turns Global; A observes it and is applied.
+    B and C finish afterwards in either order: neither re-verifies. A later check D that observes a
+    restored deployment does re-verify."""
+    t, b = azure_setup(world)
+    gw = world.gateway()
+    world.clock.advance(minutes=15)
+    observed_b = world.clock()
+    observed_c = observed_b + timedelta(seconds=2)
+    from core.verification import CheckOutcome, apply_outcome
+
+    def apply(outcome: CheckOutcome, observed: datetime, checked: datetime) -> Applied:
+        with world.app.begin() as s:
+            s.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": str(t.tenant_id)})
+            row = s.execute(select(Binding).where(Binding.id == b).with_for_update()).scalar_one()
+            return apply_outcome(s, row, outcome, checked, "2026.11.10-1", world.pager,
+                                 reads_started_at=observed)
+
+    world.clock.advance(seconds=5)
+    world.azure_reader.recreate(HOST, DEP, "GlobalStandard", world.clock())
+    with world.app.begin() as s:  # A: reads start after the swap, applied first
+        a = verify_binding(s, world.worker_services(), t.tenant_id, b, world.clock())
+    assert a.result == "config_mismatch" and a.applied
+    finish = world.clock() + timedelta(seconds=10)
+    late_c = apply(CheckOutcome("match"), observed_c, finish)
+    late_b = apply(CheckOutcome("match"), observed_b, finish + timedelta(seconds=1))
+    assert late_c.applied is False and late_b.applied is False
+    world.clock.advance(minutes=1)
+    assert code_of(world.chat(gw, t.key, "gpt-4o")) == "route_unverified"
+    # D: deployment restored and checked later: a newer observation re-verifies.
+    world.azure_reader.recreate(HOST, DEP, "Standard", world.clock())
+    world.clock.advance(minutes=15)
+    assert world.verify(t, b).result == "config_mismatch"  # the restore itself is a change; re-baselined
+    world.clock.advance(minutes=15)
+    assert world.verify(t, b).result == "match"  # D: a newer observation re-verifies
+    assert code_of(world.chat(gw, t.key, "gpt-4o")) == "ok"
+
+
+def test_b1_012_older_mismatch_still_flags_its_window(world: World) -> None:
+    """A mismatch observed before a newer verifying match does not un-verify, but flags the requests
+    served after the earlier match it contradicts."""
+    t, b = azure_setup(world)  # match observed 10:00
+    gw = world.gateway()
+    world.clock.advance(minutes=5)
+    assert code_of(world.chat(gw, t.key, "gpt-4o")) == "ok"  # 10:05 served
+    from core.verification import CheckOutcome, apply_outcome
+
+    observed_old = world.clock()  # 10:05 observation (mismatch), finishing late
+    world.clock.advance(minutes=10)
+    assert world.verify(t, b).result == "match"  # 10:15 observation verifies
+    with world.app.begin() as s:
+        s.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": str(t.tenant_id)})
+        row = s.execute(select(Binding).where(Binding.id == b).with_for_update()).scalar_one()
+        late = apply_outcome(s, row, CheckOutcome("config_mismatch", ("sku_not_eligible",)),
+                             world.clock() + timedelta(seconds=30), "2026.11.10-1", world.pager,
+                             reads_started_at=observed_old)
+    assert late.applied is False and late.flagged_requests == 1
+    assert served(world)[0] == ("completed", ["config_changed_window"])
+
+
+# ------------------------------------------------------------------------- B1-005 part (N4)
+def test_b1_005_console_cannot_queue_jobs_for_other_tenants_or_kinds(world: World) -> None:
+    world.activate()
+    a, b = world.tenant("alpha"), world.tenant("bravo")
+    world.bind(b, world.aws_conn(b), HAIKU, "haiku")
+    payload = json.dumps({"route_id": HAIKU, "changed_at": "x", "reason": "spoof"})
+    attempts: list[tuple[str, dict[str, object]]] = [
+        ("INSERT INTO job (kind, dedupe_key, payload) VALUES ('notify_route_suspended', 'n4', CAST(:p AS jsonb))",
+         {"p": payload}),
+        ("INSERT INTO job (kind, dedupe_key, tenant_id, payload) VALUES ('notify_route_suspended', 'n4b', :t, "
+         "CAST(:p AS jsonb))", {"p": payload, "t": a.tenant_id}),
+        ("INSERT INTO job (kind, dedupe_key, tenant_id, payload) VALUES ('verify_binding', 'n4c', :o, '{}')",
+         {"o": b.tenant_id}),
+    ]
+    eng = create_engine(CONSOLE_URL)
+    try:
+        for sql, params in attempts:
+            with eng.begin() as c:
+                c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": str(a.tenant_id)})
+                with pytest.raises(DBAPIError, match="row-level security"):
+                    c.execute(text(sql), params)
+        with eng.begin() as c:  # its own verify_binding job is allowed
+            c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": str(a.tenant_id)})
+            c.execute(text("INSERT INTO job (kind, dedupe_key, tenant_id) VALUES ('verify_binding', 'own', :t)"),
+                      {"t": a.tenant_id})
+            assert c.execute(text("SELECT count(*) FROM job")).scalar_one() == 1
+    finally:
+        eng.dispose()
+    with world.owner() as s:
+        assert s.execute(text("SELECT count(*) FROM alert")).scalar_one() == 0
+        assert s.execute(text("SELECT count(*) FROM job WHERE kind = 'notify_route_suspended'")).scalar_one() == 0
+
+
+# ------------------------------------------------------------------------- B1-007 part
+def test_b1_007_hand_built_decision_with_private_seal_is_not_sealed(world: World) -> None:
+    from core import eligibility
+    from core.eligibility import Decision
+    from core.secretvalue import SecretValue
+    from gateway.forward import forward
+
+    forged = Decision(uuid.uuid4(), uuid.uuid4(), GPT4O, "azure", "eastus", "evil-global.openai.azure.com",
+                      "gpt-4o-global", "x", "active", world.clock(), _seal=eligibility._SEAL)
+    assert not forged.is_sealed()
+    object.__setattr__(forged, "_seal", b"\x00" * 32)
+    assert not forged.is_sealed()
+    fake = FakeInference()
+    with pytest.raises(TypeError):
+        forward({"azure": fake}, forged, "chat", {}, SecretValue("x"))
+    assert fake.calls == []
