@@ -73,7 +73,7 @@ Every outbound destination per process is in [Egress destinations](#egress-desti
 | Provider translation | LiteLLM as a library, pinned (AD-03) | Saves writing two adapters `[C]`; its routing, fallback and logging features must stay off |
 | Frontend | Server-rendered HTML (Jinja) with htmx (AD-10) | Departs from the brief's Next.js suggestion `[C]`: no second toolchain; less client-side richness |
 | Database | PostgreSQL 16 on Amazon RDS, single-AZ at pilot | Row-level security and a job table in one store (AD-07); single-AZ accepts minutes of downtime on failure |
-| Storage | S3 bucket in `ca-central-1`, versioned, no replication | Reports only; no user uploads exist |
+| Storage | S3 bucket in `ca-central-1`, versioned, no replication | Reports only; no user uploads exist. Keys `<tenant_id>/<source>/<purpose>/<name>` built by `core.storage.object_key`; every store call refuses a key outside the caller's tenant; private bucket, no public URL (B2; local MinIO bucket `mapleroute-dev`, region `us-east-1`) |
 | Queue and workers | Job table with `FOR UPDATE SKIP LOCKED`; one `worker` process | No Redis to locate, patch or evidence |
 | Integrations | Bedrock runtime and control plane, STS, CloudTrail lookup; Azure inference endpoint and Resource Manager; Stripe; OIDC | Each is a named egress destination |
 | AI | None | The brief's "no agents" `[C]` is kept |
@@ -303,7 +303,8 @@ Example message for `route_not_eligible`: "No Canada-listed route is bound to mo
 | Data | `GET /healthz` | none | No tenant data |
 | Console | Screens S-01 to S-15 ([App-flow.md](App-flow.md#screen-and-route-inventory)) | Session | HTML |
 | Console | `POST /api/projects/{pid}/connections`, `POST …/connections/{cid}/verify`, `POST …/routes`, `POST …/keys`, `DELETE …/keys/{kid}` | Session, role `owner` or `engineer` | Mutations carry a CSRF token and an idempotency token from the form |
-| Console | `GET /api/projects/{pid}/requests`, `GET /api/reports/{id}/file` | Session, any tenant role | File links are signed, 5-minute, built from the public base URL (R-16) |
+| Console | `GET /api/projects/{pid}/requests`, `GET /api/reports`, `GET /api/reports/{id}/file` | Session, any tenant role | File links are signed, 5-minute, built from the public base URL (R-16). As built (B2): the link is the public-base URL of the authorised file endpoint, which streams the object after a session and row-level-security check and a SHA-256 match; presigned S3 links are capped at 300 s and not exposed yet |
+| Console (B2) | `POST /auth/local/enrol`, `…/enrol/complete`, `…/sign-in`; `GET /auth/session`; `POST /auth/logout`, `/auth/logout-all`, `/auth/reauth`, `/auth/tenant`, `/auth/invitations/accept`; `POST /api/onboarding`; `GET /api/members`, `POST /api/members/invitations`, `PATCH`/`DELETE /api/members/{id}` | Enrolment and sign-in: none (rate limited); others: session; members: role `owner` | Unsafe methods carry the anti-forgery token; Origin must be the console's |
 | Console | `POST /api/ops/allowlist/versions`, `POST …/{id}/approve`, `POST /api/ops/routes/{id}/suspend` | Session, role `operator` | Two-step confirmation |
 | Console | `POST /api/webhooks/stripe` | Signature | Idempotent on event ID |
 
@@ -379,7 +380,7 @@ L3 allows exactly these. "Endpoint" means a VPC endpoint in `ca-central-1`; "pro
 | worker | `docs.aws.amazon.com`, `learn.microsoft.com`, `docs.cloud.google.com` | Proxy | Outbound: URL only |
 | console | `login.microsoftonline.com`, `accounts.google.com`, `oauth2.googleapis.com`, `www.googleapis.com` | Proxy | Sign-in redirects, tokens, signing keys |
 | console | `api.stripe.com` | Proxy | Billing contact, plan, usage totals |
-| console | KMS, S3, logs, email service | Endpoint | Encrypt; signed links; invitations |
+| console | KMS, S3, logs, email service | Endpoint | Encrypt; signed links; invitations. Local development (B2): SMTP to Mailpit `127.0.0.1:1025` and the S3 API of MinIO `127.0.0.1:9000`, selected by settings only |
 | all | Image registry, secret store | Endpoint | Images; MapleRoute's own secrets |
 
 Inbound only: the load balancer; Stripe webhooks; the external uptime probe on `/healthz`; GitHub's deploy role (no network path into the VPC; it calls the AWS API). Alerts go to tenants by email and to the founder by page from AWS services in `ca-central-1` `[A]`; pages carry tenant IDs, not names. IT-20 tests one allowed and one refused host per process.
@@ -403,7 +404,7 @@ One person is on call; there is no second responder. That is an accepted gap.
 
 ## 8. Crosscutting concepts
 
-- **Identity.** Console users sign in through Microsoft or Google OIDC `[C]` (AD-13). No passwords and no email links. API clients use project keys. A user is identified by (identity provider, subject), never by email or email domain. **One tenant-resolution rule:** a signed-in user with no membership either creates a new tenant in S-02 and becomes its owner, or accepts an invitation; an invitation is a one-time link bound to an email address and is accepted only when the signed-in identity's verified email claim equals it, after which the membership is bound to the subject. Nobody joins a tenant because of an email domain.
+- **Identity.** Console users sign in through Microsoft or Google OIDC `[C]` (AD-13). No passwords and no email links. **As built (B2, 2026-11-11): OIDC is deferred** (it needs registered applications); a local identity provider stands in behind the same interface: password (Argon2id, 12 to 128 characters) plus a TOTP authenticator code on every sign-in, `amr` = `pwd`, `otp`. An emailed one-time link (15 minutes) only proves an address before its credential exists; it never signs in, and there is no email recovery. Sessions: `__Host-mr_session` cookie, 256-bit token stored as SHA-256, 30-minute idle and 12-hour absolute lifetime, new token at sign-in, re-authentication and tenant switch; anti-forgery token derived from the session token on every unsafe request; Origin checked. Anti-automation (ASVS 6.1.1): per client address 30 sign-in requests a minute, per email 10 per 15 minutes and 3 enrolment requests per 15 minutes (process memory), and a credential locks for 15 minutes after 10 consecutive failures (database); lockout can be triggered by a third party knowing the address, accepted for the pilot. Invitations: 7 days, one use. Code: `core.identity`, `core.local_idp`, `console.auth` ([verification-report-fixing.md](verification-report-fixing.md#2b-build-milestone-b2-local-sign-in-mail-file-storage-2026-11-11), O-18). API clients use project keys. A user is identified by (identity provider, subject), never by email or email domain. **One tenant-resolution rule:** a signed-in user with no membership either creates a new tenant in S-02 and becomes its owner, or accepts an invitation; an invitation is a one-time link bound to an email address and is accepted only when the signed-in identity's verified email claim equals it, after which the membership is bound to the subject. Nobody joins a tenant because of an email domain.
 - **Operator sign-in.** `/ops` is served on a separate host, limited to the founder's Entra ID account, and requires an ID token whose `amr` claim shows multi-factor authentication `[A]` and whose authentication time is under 5 minutes old before approve, suspend or resume (re-authentication). Tenant owners may switch on the same `amr` check for their users; where an identity provider sends no such claim it cannot be checked.
 - **Tenancy.** Every tenant table has `tenant_id`; PostgreSQL row-level security reads a session setting that `core.tenancy` sets once per request or job from the authenticated context. The three processes use different database roles, and the console's `/ops` routes a fourth ([schema.md](schema.md#roles-and-permissions)); the three privileged functions are owned by a non-superuser definer role with `pg_temp` last in their search path. Object keys start with the tenant ID (R-05, R-13).
 - **Logging.** Structured JSON; a correlation ID equal to the request ID travels through gateway, jobs and retries (R-12). An allow-list of loggable fields; bodies, headers named `authorization` or `api-key`, and provider error text are never passed to the logger.
@@ -425,11 +426,11 @@ One person is on call; there is no second responder. That is an accepted gap.
 | Requirement | Planned control | Status |
 |---|---|---|
 | 6.3.3 multi-factor; 6.8.4 authentication strength from the identity provider | Operator: `amr` and recent authentication checked. Tenant users: checked only if the owner enables it and the provider sends the claim | **Partly met**: off by default for tenants; Google's claim support unverified |
-| 6.3.6 email not an authentication mechanism | No email-based sign-in or recovery exists; invitations grant nothing without single sign-on | Planned |
+| 6.3.6 email not an authentication mechanism | No email-based sign-in or recovery exists; invitations grant nothing without single sign-on | Implemented for the local provider (B2): email proves an address at enrolment only |
 | 6.8.1 identity not spoofable across providers; 10.5.2 user identified by `sub` | Identity key is (provider, subject) | Planned |
 | 6.8.2 assertion signatures validated; 10.5.1 nonce; 10.5.3 issuer match; 10.1.2, 10.2.1 flow bound to the session with PKCE and state | Standard OIDC code flow with a maintained library | Planned |
-| 3.3.1, 3.3.2, 3.3.4 cookie attributes; 3.4.1 HSTS; 3.5.1 cross-origin request validation | `__Host-` session cookie, Secure, HttpOnly, SameSite=Lax; HSTS one year; anti-forgery token on every mutation | Planned |
-| 7.2.1, 7.2.4, 7.4.1 session verification, renewal, termination; 7.3.1 inactivity timeout | Server-side sessions, new token at sign-in, invalidated at sign-out, 30-minute idle timeout | Planned |
+| 3.3.1, 3.3.2, 3.3.4 cookie attributes; 3.4.1 HSTS; 3.5.1 cross-origin request validation | `__Host-` session cookie, Secure, HttpOnly, SameSite=Lax; HSTS one year; anti-forgery token on every mutation | Implemented and tested (B2) |
+| 7.2.1, 7.2.4, 7.4.1 session verification, renewal, termination; 7.3.1 inactivity timeout | Server-side sessions, new token at sign-in, invalidated at sign-out, 30-minute idle timeout | Implemented and tested (B2); 12-hour absolute lifetime added (7.3.2) |
 | 7.5.3 further authentication before highly sensitive operations | Operator re-authentication before approve, suspend, resume. Tenant deletion uses confirm-by-typing only | **Partly met** |
 | 8.4.2 layered protection of administrative interfaces | Separate host, single account, multi-factor claim. No device posture or contextual risk analysis | **Not met** beyond those three |
 | 8.2.1, 8.2.2, 8.3.1 function and data access at a trusted layer | Role checks in `core`; row-level security | Planned |
@@ -464,7 +465,7 @@ One person is on call; there is no second responder. That is an accepted gap.
 | AD-10 | Server-rendered console | One toolchain |
 | AD-11 | Evidence grade attached to each report line type in code | Prevents overstated claims |
 | AD-12 | Allow-list versions immutable, hashed, operator-approved in two steps | Accountability for the one document that defines eligibility |
-| AD-13 | Single sign-on only | No password or email factor to defend |
+| AD-13 | Single sign-on only | No password or email factor to defend. B2 deviation: local password plus TOTP provider until OIDC is built (O-18) |
 
 ## 10. Quality requirements
 

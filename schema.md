@@ -2,7 +2,7 @@
 
 **Question this file answers:** what data exists, who owns it, and how does it change?
 
-PostgreSQL 16. Build milestone B1 (2026-11-11) implemented the tables the core needs in `backend/migrations/sql/0001_core.sql` (models in `backend/core/models.py`); the remaining tables are still proposed. B1 deviations are listed in [verification-report-fixing.md](verification-report-fixing.md#2a-build-milestone-b1-2026-11-11). Requirements: [PRD.md](PRD.md#must-haves). Runtime rules: [TRD.md](TRD.md). There is **no table or column for prompt or response content**, by design (AD-05).
+PostgreSQL 16. Build milestone B1 (2026-11-11) implemented the tables the core needs in `backend/migrations/sql/0001_core.sql` (models in `backend/core/models.py`); build milestone B2 added `session`, `local_credential`, `email_challenge`, `report` and the invitation columns of `membership` (`0007_local_auth_storage.sql`); the remaining tables are still proposed. B1 deviations are listed in [verification-report-fixing.md](verification-report-fixing.md#2a-build-milestone-b1-2026-11-11). Requirements: [PRD.md](PRD.md#must-haves). Runtime rules: [TRD.md](TRD.md). There is **no table or column for prompt or response content**, by design (AD-05).
 
 ## Entity-relationship diagram
 
@@ -62,8 +62,11 @@ erDiagram
 | | `is_operator` | bool | no | false |
 | `membership` T | `user_id` | uuid | yes | references `user_account`; unique (`tenant_id`, `user_id`) |
 | | `role` | text | no | check in (`owner`, `engineer`, `reviewer`) |
-| | `invited_email`, `invite_token_hash`, `accepted_at` | text, bytea, timestamptz | yes | `user_id` is null until acceptance; acceptance requires the verified email claim to equal `invited_email`, then binds the subject |
+| | `invited_email`, `invite_token_hash`, `invite_expires_at`, `accepted_at` | text, bytea, timestamptz, timestamptz | yes | `user_id` is null until acceptance; acceptance requires the verified email claim to equal `invited_email`, then binds the subject. As built (B2): unique (`invite_token_hash`), cleared at acceptance; check `ck_membership_member_or_invite`; accepted only through `accept_invitation()` |
 | `session` | `user_id`, `token_hash`, `expires_at`, `last_seen_at` | uuid, bytea, timestamptz, timestamptz | no | unique (`token_hash`); deleted at sign-out |
+| | `tenant_id`, `idp`, `amr`, `auth_time` | uuid, text, text[], timestamptz | `tenant_id` yes | B2: the chosen tenant (re-checked against membership on every request), the provider, its `amr` and the time of the last authentication; check `expires_at > auth_time`; index (`user_id`); cascade on user and tenant deletion |
+| `local_credential` (B2) | `user_id` (key), `email_normalised`, `password_hash`, `totp_ciphertext`, `totp_wrapped_key`, `totp_kms_key_arn`, `totp_confirmed_at`, `totp_last_step`, `failed_count`, `locked_until` | mixed | mixed | Local identity provider only; unique (`email_normalised`); Argon2id hash; TOTP seed envelope-encrypted with context (user, `totp_seed`); `totp_last_step` refuses a replayed code; check `failed_count >= 0` |
+| `email_challenge` (B2) | `purpose`, `email_normalised`, `token_hash`, `expires_at`, `used_at` | text, text, bytea, timestamptz, timestamptz | `used_at` yes | One-time enrolment link; unique (`token_hash`); `purpose` check in (`enrol`) |
 | `form_token` T | `token`, `result_ref`, `used_at` | uuid, text, timestamptz | mixed | unique (`tenant_id`, `token`); purged after 24 h |
 
 ### Projects, connections, keys
@@ -174,6 +177,7 @@ Check: `state <> 'rejected'` requires `route_id` and `allowlist_version`. Allowe
 | | `kind` | text | no | check in (`monthly`, `custom`) |
 | | `state` | text | no | check in (`generating`, `ready`, `failed`, `withheld`) |
 | | `allowlist_versions`, `object_key`, `sha256`, `totals` | text[], text, bytea, jsonb | yes | required when `ready` (check) |
+| | `content_type`, `byte_size` | text, bigint | yes | B2, required when `ready`; checks `period_end >= period_start` and `object_key` starts with `<tenant_id>/` (R-13); built in migration `0007` with FORCE row-level security |
 | `usage_month` T | `month`, `forwarded_count`, `rejected_count` | date, bigint, bigint | no | unique (`tenant_id`, `month`) |
 | `audit_event` T | `actor_user_id`, `actor_kind`, `action`, `target`, `correlation_id`, `detail` | mixed | mixed | insert-only; `tenant_id` null allowed for operator-global actions |
 | `log_digest` T | `day`, `row_count`, `sha256` | date, bigint, bytea | no | unique (`tenant_id`, `day`) |
@@ -217,6 +221,8 @@ Check: `state <> 'rejected'` requires `route_id` and `allowlist_version`. Allowe
 - `resolve_api_key(hash)`: key ID, tenant, project and state for one hash, because the gateway learns the tenant from the key. Executable by the gateway only.
 - `tenants_bound_to_route(route)`: tenant IDs only, for suspension alerts and the 7-day removal rule. Executable by the worker and operator.
 - `route_resume_guard()`: the trigger on `route`. Refuses `suspended` → `active` unless the session user is the operator role **and** a `verification` row with `result = 'match'` whose `started_at` is after the suspension and after every later `definition_mismatch` on that route exists (fix round 3).
+
+**B2 grants and functions (migration `0007_local_auth_storage`).** Console: select and insert `user_account` on named columns but never `is_operator` (operators are set by the database owner); select, insert, delete and update (`tenant_id`, `token_hash`, `auth_time`, `amr`, `last_seen_at`) on `session`; select and insert `local_credential`, update its counters only; select, insert and update (`used_at`) on `email_challenge`; insert (`id`, `legal_name`) on `tenant` without select; insert, update (`role`) and delete on `membership` under row-level security; select `report`. Worker: select, insert and update the file columns of `report`. Two more definer functions, owned by `mapleroute_definer` with `pg_temp` last: `memberships_for_user(user)` returns (tenant, role, `require_mfa_claim`) for active tenants, and `accept_invitation(token_hash, user, now)` binds an unexpired, unused invitation whose `invited_email` equals the user's stored email, read inside the function; zero rows means refused. Both are executable by the console role only.
 
 **`job` row-level security (fix round 2, B1-005 part).** `job` is FORCE ROW LEVEL SECURITY: the worker sees all rows; the console may insert and see only `verify_binding` jobs for its own tenant; the operator only tenant-less `notify_route_suspended` jobs. A tenant session cannot queue work or alerts for another tenant. Fix round 3: the console may insert only the keys `<binding>:initial` and `<binding>:manual:<token>`, never a scheduled slot `<binding>:<slot>`, and only for a binding of its own tenant (the policy reads `binding` under its own row-level security); with the tenant-scoped unique key, no row of one tenant can collide with another tenant's key.
 

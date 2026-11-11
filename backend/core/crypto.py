@@ -81,3 +81,16 @@ def local_key_service() -> FakeKeyService:
 
     hex_key = settings().fake_kms_key_hex
     return FakeKeyService(bytes.fromhex(hex_key) if hex_key else None)
+
+
+def encrypt_with_context(ks: KeyService, context: dict[str, str], plaintext: bytes) -> Envelope:
+    """Envelope-encrypt bytes under a fresh data key bound to ``context`` (B2: TOTP seeds)."""
+    dk, wrapped = ks.generate_data_key(context)
+    nonce = os.urandom(12)
+    return Envelope(nonce + AESGCM(dk).encrypt(nonce, plaintext, json.dumps(context, sort_keys=True).encode()),
+                    wrapped, ks.key_arn)
+
+
+def decrypt_with_context(ks: KeyService, context: dict[str, str], ciphertext: bytes, wrapped: bytes) -> bytes:
+    dk = ks.decrypt_data_key(wrapped, context)
+    return AESGCM(dk).decrypt(ciphertext[:12], ciphertext[12:], json.dumps(context, sort_keys=True).encode())

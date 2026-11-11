@@ -2,7 +2,7 @@
 
 Canonical instructions for any agent or developer working in this repository. [CLAUDE.md](CLAUDE.md) adds product-specific guidance and defers to this file.
 
-**State of the repository:** ten planning documents plus build milestone B1 (branch `feat/b1-foundation`, 2026-11-11): `backend/` holds the deterministic core (allow-list, `forwardable`, verification, request log, tenancy), a gateway, a minimal console API and a worker, all against in-memory fakes for AWS, Azure, KMS, alerting and sign-in. No real provider integration, sign-in, report, deployment or infrastructure exists. The owner's authorisation to build before T-0.6.1, and what was tested, are in [verification-report-fixing.md](verification-report-fixing.md#2a-build-milestone-b1-2026-11-11). Every command not marked "exists" below is **proposed**; do not report a command as run unless you ran it and it exists.
+**State of the repository:** ten planning documents plus build milestones B1 (branch `feat/b1-foundation`) and B2 (branch `feat/b2-local-auth`), 2026-11-11: `backend/` holds the deterministic core (allow-list, `forwardable`, verification, request log, tenancy), a gateway, a console API and a worker. B2 added console sign-in through a **local identity provider (password plus TOTP)** with server-side sessions, invitations and roles, mail through SMTP (local Mailpit) and report files through the S3 API (local MinIO). AWS, Azure, KMS and alerting are still in-memory fakes; OIDC sign-in is deferred (O-18); no report generation, UI, deployment or infrastructure exists. The owner's authorisation to build before T-0.6.1, and what was tested, are in [verification-report-fixing.md](verification-report-fixing.md#2a-build-milestone-b1-2026-11-11) and [section 2b](verification-report-fixing.md#2b-build-milestone-b2-local-sign-in-mail-file-storage-2026-11-11). Every command not marked "exists" below is **proposed**; do not report a command as run unless you ran it and it exists.
 
 ## Reading order
 
@@ -75,6 +75,16 @@ Before writing a helper, search `core`. Region parsing, key hashing, object keys
 | Job table enqueue, claim, retry | `core.jobs` | |
 | Audit events | `core.audit` | |
 | Clock | `core.clock` | Tests set it |
+| Sign-in identity, sessions (token hash, idle and absolute expiry, rotation), anti-forgery token, memberships across tenants | `core.identity` | Shared by every identity provider; OIDC would hand it the same `Identity` (B2) |
+| Local identity provider: enrolment link, password plus TOTP, lockout | `core.local_idp` | Email proves an address only; never a factor (B2) |
+| TOTP (RFC 6238), single use | `core.totp` | Standard library |
+| Password policy and Argon2id hashing | `core.passwords` | |
+| Role x action matrix | `core.permissions` | UT-12 |
+| Sign-in rate-limit windows | `core.ratelimit` | Process memory; lockout is in the database |
+| Mail interface, SMTP (Mailpit locally), in-memory fake | `core.mail` | Bodies hold one-time links; never logged |
+| Object keys (tenant, source, purpose), S3 store (MinIO locally), in-memory fake, presign at most 5 minutes | `core.storage` | Every call refuses a key outside the caller's tenant (R-13) |
+| Store and read a report file with its hash | `core.reports` | Generation (T-5.1.x) not built |
+| Envelope encryption under any context | `core.crypto.encrypt_with_context` | TOTP seeds |
 | Per-binding advisory lock (worker exclusive, gateway shared); per-binding check lease (one check at a time, token, generation, database-clock `CHECK_LEASE` timeout); `db_now` (database clock) | `core.locks` | Orders decisions against a mismatch being applied; checks of one binding never overlap; no worker clock in a safety decision (B1-003, B1-012) |
 
 ### Commands
@@ -82,7 +92,8 @@ Before writing a helper, search `core`. Region parsing, key hashing, object keys
 | Command | Status |
 |---|---|
 | `make dev` (migrate dev database, start gateway :8110, console :3110, worker; health summary) | Exists (B1); runs processes directly, no Compose |
-| `make smoke`, `make test`, `make lint`, `make typecheck`, `make check-imports`, `make orm-parity`, `make check` | Exist (B1) |
+| `make smoke`, `make test`, `make lint`, `make typecheck`, `make check-imports`, `make orm-parity`, `make check` | Exist (B1). Since B2 `make test` also runs the Mailpit and MinIO integration tests (skipped if a service is down) and the console health check includes mail and storage |
+| `backend/.env` (gitignored) from `backend/.env.example` | Exists (B2): local SMTP and MinIO settings; names only in the example |
 | `tools/orm_parity` (`python -m tools.orm_parity`) | Exists (B1) |
 | `tools/check_imports`, `tools/db_bootstrap`, `tools/dev` | Exist (B1) |
 | `tools/check_migrations`, `tools/canary_scan`, `tools/publish_allowlist`, `tools/restore_drill`, `tools/link_check` | Proposed |

@@ -38,9 +38,9 @@ All **Not run**.
 | Normal forwarding and streaming | IT-01, IT-02 | IT-01 passed on the stub; IT-02 passed with a simulated disconnect (section 2a) |
 | Verification, mismatch kinds and suspension | UT-06, UT-10, IT-05, IT-10 | UT-06, UT-10, IT-05 passed on fakes; IT-10 partly (alert rows, no delivery) |
 | Customer-side policy, Azure change window, customer logging state | IT-21, IT-22 | Passed on fakes (three IT-21 variants); not on real accounts (T-6.1.1) |
-| Sign-in, identity and operator access | UT-13 | Not run |
+| Sign-in, identity and operator access | UT-13 | Partly, B2 (section 2b): the local provider's parts ran and passed (invitation with a different verified email refused; operator without a second factor or a recent authentication refused). The OIDC parts (nonce, issuer, same email from the other provider) Not run: OIDC deferred |
 | No content or credential persistence | UT-07, IT-06, IT-07 | UT-07 passed; IT-06 partly (database, application and server logs; bucket and restored backup Not run); IT-07 partly since fix round 1 (ciphertext refused to the console role; KMS decrypt Not run) |
-| Tenant isolation and roles | UT-12, IT-08 | IT-08 passed (rows, API, job; no files exist yet); UT-12 Not run |
+| Tenant isolation and roles | UT-12, IT-08 | IT-08 passed (rows, API, job; files since B2 against MinIO, section 2b); UT-12 passed in B2 |
 | Request state and timeouts | UT-05, IT-09 | Passed |
 | Report and register | UT-08, IT-16 | Not run |
 | Reconciliation | IT-11 | Not run |
@@ -227,6 +227,45 @@ Reviewer's notes (unchanged): N3/R2 rewritten for the lease design (N3v2, N3v3, 
 
 **Commands after round 4** (from `mapleroute-ca/`): `make test` (re-migrates `mapleroute_test`): **110 passed, 0 failed**; `make lint` (ruff): all checks passed; `make typecheck` (mypy strict): no issues in 50 files; `make check-imports`: OK; `make orm-parity`: OK; `make smoke`: three services ok. Reviewer's round-4 script, unchanged: **13 passed, 2 failed (L4a, L4d)**. L4b, N3v2, N3v3, R2v2, L1, L1b, L2, L3, L3b, L4c, L6, L6b and L7 pass. L4a and L4d now fail on their premise: both expect a worker with a skewed clock to take over a live lease, and with database-clock leases that worker is skipped (L4d's assertion is literally "expected the skewed worker to overlap"). The developer's `test_l4a_…` asserts the new behaviour for the same setup: B skipped, A's mismatch un-verifies, requests rejected. Old script: 21 passed, 2 failed (N3, R2, setup only, as in round 3). Outstanding: no readiness check yet refuses a non-empty `clock_override` outside tests. Not run: real AWS or Azure.
 
+## 2b. Build milestone B2: local sign-in, mail, file storage (2026-11-11)
+
+Branch `feat/b2-local-auth`, created from `feat/b1-foundation` at `40a8e2b` (pushed and independently reviewed; no open review item was named, so no Step 0). Owner request 2026-11-11: build what needs no external account. Synthetic data only; Mailpit and MinIO on this machine; no real provider, identity provider or deployment.
+
+**Deviation from AD-13, recorded.** The TRD specifies Microsoft and Google OIDC only, with no password and no email link. Registered identity-provider applications are external accounts, so OIDC stays **deferred** (T-4.1.1 (a), UT-13 OIDC parts). In its place, behind the same interface, a **local identity provider: password plus TOTP authenticator code**. It produces the same `Identity` an OIDC callback would (`idp = 'local'`, random subject, verified email, `amr = [pwd, otp]`, `auth_time`), and sign-in, sessions, tenant resolution, invitations and the operator checks are shared code. Email is used only to prove an address before a credential exists (one-time enrolment link) and for invitations; it never signs anyone in and there is no email recovery (ASVS 6.3.6). `MAPLEROUTE_IDENTITY_PROVIDERS` accepts only `local` today. Whether the local provider stays once OIDC exists is a founder decision (O-18).
+
+**Tasks implemented.** T-4.1.1 (b) session store and cookie attributes, (d) operator claim check and re-authentication, with the local provider in place of (a); T-4.1.2 (a) onboarding, (b) invitations, (c) role checks (`core.permissions`); report-file storage and the authorised download of T-5.1.x's output (generation itself still blocked); mail through SMTP (Mailpit locally); UT-11 key parts (`core.storage.object_key`). Migration `0007_local_auth_storage`: `session`, `local_credential`, `email_challenge`, `report` (FORCE RLS), invitation columns on `membership`, two definer functions `memberships_for_user` and `accept_invitation`, column grants ([schema.md](schema.md#roles-and-permissions)). The B1 "admit nobody" authenticator is removed; the default is the session authenticator; unit tests may still inject a fake principal.
+
+**Tests that ran** (`backend/tests/test_b2_auth.py`, `backend/tests/test_b2_integration.py`; all passed):
+
+| Test | What it shows |
+|---|---|
+| `test_totp_rfc6238_vector_and_single_use` | RFC 6238 vector; a code is accepted once; outside the drift window refused |
+| `test_password_policy` | 12 to 128 characters, blocked context words, no composition rules |
+| `test_ut12_role_action_matrix_matches_prd` | UT-12: role x action matrix equals PRD.md roles |
+| `test_sliding_window` | Rate-limit window |
+| `test_enrol_sign_in_session_cookie_and_logout` | Enrolment does not sign in; `__Host-` cookie with Secure, HttpOnly, SameSite=Lax, Path=/, no Domain; HSTS, nosniff, CSP; only the token hash stored; logout invalidates the old cookie |
+| `test_enrolment_link_reused_and_expired_refused` | Reused and expired (16 min) enrolment links refused; an enrolled address gets a notice without a link |
+| `test_wrong_factor_replayed_code_and_lockout` | Wrong password refused; replayed TOTP refused; unknown email gets the same answer; lock after 10 failures, released after 15 min |
+| `test_sign_in_rate_limit` | 429 per email for sign-in and for enrolment requests |
+| `test_session_idle_and_absolute_expiry_and_new_token_per_sign_in` | New token per sign-in and the old one ends; 30-minute idle and 12-hour absolute limits |
+| `test_anti_forgery_and_origin_on_mutations` | Mutations without or with a wrong anti-forgery token, or from a foreign Origin, refused; sign-in from a foreign Origin refused |
+| `test_cross_tenant_session_refused` | A's session on B's project: 404; switching or signing in into B without membership refused |
+| `test_invitation_flow_email_bound_one_use_and_expiry` | UT-13 part: invitation refused to another address at the same domain; accepted by the invited address; one use; expired refused; reviewer cannot write or see members; last owner cannot be demoted; removing a member ends their sessions |
+| `test_console_role_cannot_create_operator` | The console role can neither insert nor set `is_operator` |
+| `test_operator_session_needs_recent_reauth` | Operator approve refused 6 minutes after authentication; `/auth/reauth` with password and code allows it |
+| `test_secrets_never_logged` | Password, TOTP seed, enrolment token, session cookie and anti-forgery token absent from logs; only an Argon2id hash and ciphertext stored |
+| `test_b2_sign_in_end_to_end_through_mailpit` | SMTP to Mailpit; link read through the Mailpit API; enrolment, sign-in, replay refused, reused and expired links refused, logout, rate limit; test messages deleted |
+| `test_b2_invitation_through_mailpit` | Invitation mail through Mailpit and acceptance |
+| `test_b2_report_files_in_minio_tenant_scoped` | IT-08 file part and UT-11 parts: report stored in MinIO under `<tenant>/worker/report/`; A downloads it (hash matches); B's session gets an empty list and 404; the store refuses A's key under B for get, put and presign; unsigned GET refused (403); presigned link works, more than 300 s refused; an altered object refused by hash; objects deleted and deletion checked |
+
+**Commands** (from `mapleroute-ca/`, clean test database): `make test` (drops and re-migrates `mapleroute_test`): **128 passed, 0 failed** (110 from B1, 18 new); `make lint` (ruff): all checks passed; `make typecheck` (mypy strict): no issues in 62 files; `make check-imports`: OK; `make orm-parity`: OK; `make smoke`: gateway, console (database, mail and storage ready) and worker ok. Test configuration: botocore's `utcnow` deprecation warning is ignored in `pyproject.toml`; with it recorded, the run stalled about 14 minutes after the last test on this machine (cause not found).
+
+**OWASP ASVS 5.0.0 requirements implemented** (local provider; IDs read from the 5.0.0 text on 2026-11-11; implemented is not a compliance claim): 3.3.1, 3.3.2, 3.3.3, 3.3.4 (cookie); 3.4.1, 3.4.4, 3.4.5, 3.4.6 (headers; CSP `default-src 'none'` on the JSON API); 3.5.1, 3.5.3 (anti-forgery token and Origin check on unsafe methods); 6.1.1 (anti-automation documented in TRD.md); 6.2.1, 6.2.5, 6.2.8, 6.2.9, 6.2.10 (password policy); 6.3.1 (rate limits and lockout); 6.3.2 (no default accounts); 6.3.3 (password plus TOTP on every sign-in); 6.3.6 (email not a factor); 6.3.8 (same answer for unknown addresses, enrolled addresses and wrong factors; dummy hash for unknown addresses); 6.4.1 (enrolment link random, 15 minutes, one use); 6.4.2 (no hints or questions); 6.5.1, 6.5.3, 6.5.5, 6.5.8 (TOTP single use, CSPRNG seed, 30-second step, server time); 6.8.1 (identity is provider plus subject); 6.8.4 (operator `amr` and recency checked); 7.2.1, 7.2.2, 7.2.3, 7.2.4 (server-side 256-bit reference tokens, new token at sign-in and re-authentication); 7.3.1, 7.3.2 (30 minutes idle, 12 hours absolute); 7.4.1 (logout deletes the session); 7.5.3 (operator re-authentication before approve, suspend, resume); 8.2.1, 8.4.1 (role checks in `core`; row-level security on `report`; tenant-prefixed keys).
+
+**Not implemented or not met:** 6.1.2 and 6.2.11 only partly (a short built-in word list); 6.2.2, 6.2.3 (no password change); 6.2.4 (no 3,000-password list); 6.2.12 (no breached-password check); 6.2.6, 6.2.7 (no UI yet); 6.3.5, 6.3.7 (no notice of suspicious sign-ins or factor changes); 6.4.3, 6.4.4 (no reset or factor recovery: a lost authenticator needs the operator, process not built); 6.5.6 (no factor revocation screen); 6.8.2, 6.8.3 and the V10 OIDC items (deferred with OIDC); 7.1.1-7.1.3 only in TRD.md, 7.1.2 concurrent-session limit not set; 7.4.2 (no account disable); 7.4.3, 7.5.1, 7.5.2 (no session list or factor change); 7.4.4 (no UI); 7.4.5 (no administrator session termination beyond member removal); 7.6.1, 7.6.2 (no IdP session); 3.4.2 (no CORS configured, so none allowed); 3.4.3 only as a deny-all policy; 8.4.2 not met (unchanged).
+
+**Blocked or not run.** OIDC (needs registered applications); real SMTP provider and S3 in `ca-central-1` (accounts); report generation (T-5.1.x); IT-06 bucket and restored-backup parts (no generated report content and no backup); UI screens S-01, S-02, S-13, S-15.
+
 ## 3. Traceability of must-haves
 
 | MH | Screen or API | Decision | Schema or permission | Tasks | Planned tests |
@@ -294,6 +333,7 @@ Open before any review. None is hidden by a compliance or residency claim.
 | O-14 | F-004, closed with this part open. The revised stop rule still stops wrongly about 36% of the time at an assumed questionnaire yield; the yield is unknown (F-004) | Questionnaires per meeting from T-0.4.2 | [Decision.md](Decision.md#93-proposed-revision-p--a-change-to-the-rules-above-not-a-restatement) |
 | O-15 | F-005, closed with this part open. Every location in the draft subprocessor register is "not evidenced"; the uptime-probe vendor is not chosen | T-0.4.3 for pilot tools; T-0.6.2 and T-5.1.1 for production | [Decision.md](Decision.md#43-evidence-grades) |
 | O-16 | F-003, closed with this part open. Break-even with founder pay is unreachable at the assumed rates; the pool-count option in the Build gate makes 12 accounts reachable, not 45 | Tier chosen by converted pilots, referral share, counted pool, observed churn | [Decision.md](Decision.md#73-cash-required-during-the-ramp) |
+| O-18 | B2 deviation from AD-13: console sign-in is a local provider (password plus TOTP) until OIDC is built; whether it remains afterwards, and the lost-authenticator process, are undecided | Founder decision; OIDC applications registered (T-4.1.1 (a)) | [TRD.md](TRD.md#8-crosscutting-concepts); section 2b |
 | O-17 | F-013, closed with this part open. Diagram rendering on GitHub not checked by author or reviewer | View after push | This file |
 
 ### Author self-check log (not independent review)

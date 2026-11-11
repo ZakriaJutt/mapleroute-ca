@@ -153,7 +153,11 @@ def test_connect_bind_verify_through_console(world: World) -> None:
 
 def test_operator_api_publish_approve_suspend_resume(world: World) -> None:
     op = world.operator()
-    ops = world.console(Principal(op, None, None, is_operator=True))
+    # B2: approve, suspend and resume need a second factor and an authentication under 5 minutes old.
+    stale = world.console(Principal(op, None, None, is_operator=True, amr=("pwd", "otp"),
+                                    auth_time=world.clock() - timedelta(minutes=6)))
+    no_mfa = world.console(Principal(op, None, None, is_operator=True, amr=("pwd",), auth_time=world.clock()))
+    ops = world.console(Principal(op, None, None, is_operator=True, amr=("pwd", "otp"), auth_time=world.clock()))
     body = {"version": "2026.11.10-1", "routes": fixture_routes()}
     assert ops.post("/api/ops/allowlist/versions", json=body).status_code == 201
     assert ops.post("/api/ops/allowlist/versions", json=body).status_code == 200  # idempotent
@@ -163,6 +167,10 @@ def test_operator_api_publish_approve_suspend_resume(world: World) -> None:
     refused = ops.post("/api/ops/allowlist/versions", json=bad)
     assert refused.status_code == 422 and refused.json()["detail"]["refused_route"] == fixture_routes()[0]["id"]
     assert ops.post("/api/ops/allowlist/versions/2026.11.10-1/approve", json={}).status_code == 422
+    for refused_client in (stale, no_mfa):
+        assert refused_client.post("/api/ops/allowlist/versions/2026.11.10-1/approve",
+                                   json={"confirm": "2026.11.10-1"}).status_code == 401
+        assert refused_client.post(f"/api/ops/routes/{HAIKU}/suspend").status_code == 401
     ok = ops.post("/api/ops/allowlist/versions/2026.11.10-1/approve", json={"confirm": "2026.11.10-1"})
     assert ok.json()["state"] == "active"
     t = world.tenant("alpha")
@@ -178,7 +186,7 @@ def test_route_removal_in_use_waits_seven_days(world: World) -> None:
     t = world.tenant("alpha")
     world.bind(t, world.aws_conn(t), HAIKU, "haiku")
     op = world.operator()
-    ops = world.console(Principal(op, None, None, is_operator=True))
+    ops = world.console(Principal(op, None, None, is_operator=True, amr=("pwd", "otp"), auth_time=world.clock()))
     routes = [r for r in fixture_routes() if r["id"] != HAIKU]
     published = ops.post("/api/ops/allowlist/versions", json={"version": "2026.11.11-1", "routes": routes})
     assert published.status_code == 201

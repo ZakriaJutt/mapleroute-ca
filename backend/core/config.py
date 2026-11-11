@@ -13,6 +13,9 @@ import os
 from dataclasses import dataclass
 from datetime import timedelta
 from functools import lru_cache
+from pathlib import Path
+
+from core.secretvalue import SecretValue
 
 # --- Eligibility constants (TRD.md "Eligible routes") ---------------------------------
 CANADA: dict[str, frozenset[str]] = {
@@ -43,6 +46,18 @@ TOTAL_TIMEOUT_S = 600
 UNSUPPORTED_PARAMETERS = frozenset(
     {"files", "file_ids", "attachments", "batch", "background", "previous_response_id"}
 )
+
+# --- Console sign-in (B2; TRD.md "Identity", ASVS 7.1.1) -----------------------------
+SESSION_IDLE = timedelta(minutes=30)  # 7.3.1: re-authentication after 30 minutes without a request
+SESSION_ABSOLUTE = timedelta(hours=12)  # 7.3.2: re-authentication at most 12 hours after sign-in
+OPERATOR_REAUTH = timedelta(minutes=5)  # approve, suspend, resume need an authentication this recent
+ENROL_LINK_TTL = timedelta(minutes=15)  # emailed enrolment link, one use
+INVITE_TTL = timedelta(days=7)  # emailed invitation link, one use, bound to the invited email
+LOCKOUT_THRESHOLD = 10  # consecutive failed sign-ins before the credential is locked
+LOCKOUT_PERIOD = timedelta(minutes=15)
+PASSWORD_MIN, PASSWORD_MAX = 12, 128  # ASVS 6.2.1 (at least 8) and 6.2.9 (at least 64 allowed)
+SESSION_COOKIE = "__Host-mr_session"
+REPORT_LINK_TTL_S = 300  # signed report links last 5 minutes (TRD.md API contracts, R-16)
 
 
 def constants_hash() -> str:
@@ -75,14 +90,45 @@ class Settings:
     gateway_port: int
     console_port: int
     public_base_url: str
+    # Console sign-in. Only the local provider is built (B2); OIDC is deferred (TRD.md AD-13).
+    identity_providers: frozenset[str]
+    # Mail: local Mailpit has no authentication; production sets a provider's host and credentials.
+    smtp_host: str
+    smtp_port: int
+    smtp_starttls: bool
+    smtp_username: str | None
+    smtp_password: SecretValue | None
+    mail_from: str
+    # Object storage (reports). Local MinIO sets an endpoint; production uses S3 in ca-central-1.
+    s3_endpoint_url: str | None
+    s3_region: str
+    s3_bucket: str
+    s3_access_key_id: str | None
+    s3_secret_access_key: SecretValue | None
 
 
 ALLOWED_PROVIDER_MODES = frozenset({"fake"})
+ALLOWED_IDENTITY_PROVIDERS = frozenset({"local"})
+ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+
+
+def _env_file(path: Path) -> dict[str, str]:
+    """``KEY=value`` lines of the gitignored backend/.env; the process environment wins."""
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        out[key.strip()] = value.strip().strip('"').strip("'")
+    return out
 
 
 @lru_cache(maxsize=1)
 def settings() -> Settings:
-    env = os.environ
+    env = {**_env_file(Path(os.environ.get("MAPLEROUTE_ENV_FILE", str(ENV_FILE)))), **os.environ}
     db = env.get("MAPLEROUTE_DATABASE", "mapleroute_dev")
 
     def role_url(role: str) -> str:
@@ -105,7 +151,26 @@ def settings() -> Settings:
         gateway_port=int(env.get("MAPLEROUTE_GATEWAY_PORT", "8110")),
         console_port=int(env.get("MAPLEROUTE_CONSOLE_PORT", "3110")),
         public_base_url=env.get("MAPLEROUTE_PUBLIC_BASE_URL", "http://localhost:3110"),
+        identity_providers=frozenset(
+            p.strip() for p in env.get("MAPLEROUTE_IDENTITY_PROVIDERS", "local").split(",") if p.strip()
+        ),
+        smtp_host=env.get("MAPLEROUTE_SMTP_HOST", "127.0.0.1"),
+        smtp_port=int(env.get("MAPLEROUTE_SMTP_PORT", "1025")),
+        smtp_starttls=env.get("MAPLEROUTE_SMTP_STARTTLS", "false").lower() == "true",
+        smtp_username=env.get("MAPLEROUTE_SMTP_USERNAME") or None,
+        smtp_password=SecretValue(v) if (v := env.get("MAPLEROUTE_SMTP_PASSWORD")) else None,
+        mail_from=env.get("MAPLEROUTE_MAIL_FROM", "MapleRoute <no-reply@mapleroute.localhost>"),
+        s3_endpoint_url=env.get("MAPLEROUTE_S3_ENDPOINT_URL") or None,
+        s3_region=env.get("MAPLEROUTE_S3_REGION", "ca-central-1"),
+        s3_bucket=env.get("MAPLEROUTE_S3_BUCKET", "mapleroute-dev"),
+        s3_access_key_id=env.get("MAPLEROUTE_S3_ACCESS_KEY_ID") or None,
+        s3_secret_access_key=SecretValue(v) if (v := env.get("MAPLEROUTE_S3_SECRET_ACCESS_KEY")) else None,
     )
+    if not s.identity_providers or not s.identity_providers <= ALLOWED_IDENTITY_PROVIDERS:
+        raise RuntimeError("identity providers must be a non-empty subset of {'local'}; OIDC is not built")
+    if s.environment != "local" and (s.s3_endpoint_url is not None or s.s3_region != "ca-central-1"):
+        # MH-11: outside local development, stored files live in ca-central-1 only.
+        raise RuntimeError("object storage outside local development must be S3 in ca-central-1")
     if s.provider_mode not in ALLOWED_PROVIDER_MODES:
         raise RuntimeError(f"provider mode {s.provider_mode!r} is not implemented; only 'fake' exists")
     return s

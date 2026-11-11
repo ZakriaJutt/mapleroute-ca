@@ -6,7 +6,7 @@ No table or column holds prompt or response content (AD-05).
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import (
@@ -14,6 +14,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
@@ -83,9 +84,82 @@ class Membership(Base):
     user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("user_account.id"))
     role: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = _created()
+    # Pending invitation (B2): user_id is null until accepted by the identity whose verified email matches.
+    invited_email: Mapped[str | None] = mapped_column(Text)
+    invite_token_hash: Mapped[bytes | None] = mapped_column(LargeBinary)
+    invite_expires_at: Mapped[datetime | None] = mapped_column(TS)
+    accepted_at: Mapped[datetime | None] = mapped_column(TS)
     __table_args__ = (
         CheckConstraint("role IN ('owner', 'engineer', 'reviewer')", name="ck_membership_role"),
         UniqueConstraint("tenant_id", "user_id", name="uq_membership_tenant_user"),
+        UniqueConstraint("invite_token_hash", name="uq_membership_invite_token"),
+        CheckConstraint(
+            "user_id IS NOT NULL OR (invited_email IS NOT NULL AND invite_token_hash IS NOT NULL "
+            "AND invite_expires_at IS NOT NULL)",
+            name="ck_membership_member_or_invite",
+        ),
+    )
+
+
+class ConsoleSession(Base):
+    """Server-side console session (B2, T-4.1.1). Only the SHA-256 of the cookie token is stored."""
+
+    __tablename__ = "session"
+    id: Mapped[uuid.UUID] = _id()
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user_account.id", ondelete="CASCADE"), nullable=False)
+    tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tenant.id", ondelete="CASCADE"))
+    token_hash: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    idp: Mapped[str] = mapped_column(Text, nullable=False)
+    amr: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, server_default=text("'{}'"))
+    auth_time: Mapped[datetime] = mapped_column(TS, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(TS, nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(TS, nullable=False)
+    created_at: Mapped[datetime] = _created()
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_session_token_hash"),
+        CheckConstraint("expires_at > auth_time", name="ck_session_expiry"),
+        Index("ix_session_user", "user_id"),
+    )
+
+
+class LocalCredential(Base):
+    """Local identity provider factors (B2): Argon2id password hash and an envelope-encrypted TOTP seed."""
+
+    __tablename__ = "local_credential"
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user_account.id", ondelete="CASCADE"), primary_key=True)
+    email_normalised: Mapped[str] = mapped_column(Text, nullable=False)
+    password_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    totp_ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    totp_wrapped_key: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    totp_kms_key_arn: Mapped[str] = mapped_column(Text, nullable=False)
+    totp_confirmed_at: Mapped[datetime | None] = mapped_column(TS)
+    totp_last_step: Mapped[int | None] = mapped_column(BigInteger)
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    locked_until: Mapped[datetime | None] = mapped_column(TS)
+    created_at: Mapped[datetime] = _created()
+    __table_args__ = (
+        UniqueConstraint("email_normalised", name="uq_local_credential_email"),
+        CheckConstraint("failed_count >= 0", name="ck_local_credential_failed"),
+    )
+
+
+class EmailChallenge(Base):
+    """One-time emailed enrolment link (B2). Proves the address; never signs anyone in."""
+
+    __tablename__ = "email_challenge"
+    id: Mapped[uuid.UUID] = _id()
+    purpose: Mapped[str] = mapped_column(Text, nullable=False)
+    email_normalised: Mapped[str] = mapped_column(Text, nullable=False)
+    token_hash: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(TS, nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(TS)
+    created_at: Mapped[datetime] = _created()
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_email_challenge_token"),
+        CheckConstraint("purpose IN ('enrol')", name="ck_email_challenge_purpose"),
     )
 
 
@@ -510,3 +584,36 @@ class ClockOverride(Base):
     id: Mapped[bool] = mapped_column(Boolean, primary_key=True, server_default=text("true"))
     at: Mapped[datetime] = mapped_column(TS, nullable=False)
     __table_args__ = (CheckConstraint("id", name="ck_clock_override_single"),)
+
+
+class Report(Base):
+    """A tenant's stored report file (schema.md ``report``); the file is in object storage under
+    ``<tenant_id>/worker/report/...`` (R-13)."""
+
+    __tablename__ = "report"
+    id: Mapped[uuid.UUID] = _id()
+    tenant_id: Mapped[uuid.UUID] = _tenant_fk()
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'generating'"))
+    allowlist_versions: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
+    object_key: Mapped[str | None] = mapped_column(Text)
+    sha256: Mapped[bytes | None] = mapped_column(LargeBinary)
+    totals: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    content_type: Mapped[str | None] = mapped_column(Text)
+    byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = _created()
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "period_start", "period_end", "kind", name="uq_report_tenant_period_kind"),
+        CheckConstraint("kind IN ('monthly', 'custom')", name="ck_report_kind"),
+        CheckConstraint("state IN ('generating', 'ready', 'failed', 'withheld')", name="ck_report_state"),
+        CheckConstraint("period_end >= period_start", name="ck_report_period"),
+        CheckConstraint(
+            "state <> 'ready' OR (allowlist_versions IS NOT NULL AND object_key IS NOT NULL AND sha256 IS NOT NULL "
+            "AND totals IS NOT NULL AND content_type IS NOT NULL AND byte_size IS NOT NULL)",
+            name="ck_report_ready",
+        ),
+        CheckConstraint("object_key IS NULL OR starts_with(object_key, tenant_id::text || '/')",
+                        name="ck_report_object_key_tenant"),
+    )

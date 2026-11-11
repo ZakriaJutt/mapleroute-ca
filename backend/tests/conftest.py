@@ -21,6 +21,7 @@ from tests.helpers import CONSOLE_URL, GATEWAY_URL, OPERATOR_URL, OWNER_URL, WOR
 from tools import db_bootstrap
 
 TABLES = (
+    "session, local_credential, email_challenge, report, "
     "request_log, verification, logging_observation, alert, audit_event, job, form_token, binding, "
     "connection_secret, api_key, provider_connection, membership, project, allowlist_route, route, "
     "allowlist_version, user_account, tenant"

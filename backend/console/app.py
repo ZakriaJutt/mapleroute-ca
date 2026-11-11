@@ -1,8 +1,9 @@
 """Console JSON API for the core path (B1 subset of TRD.md "API contracts").
 
-Sign-in (OIDC, T-4.1.1) is blocked in B1: the default authenticator admits nobody. Tests inject an
-authenticator. Tenant mutations carry an ``Idempotency-Key`` header stored in ``form_token``;
-a second submit returns the first result. Foreign identifiers return 404 (MH-09).
+Sign-in (B2): the default authenticator is the server-side session of ``console.auth`` (local
+provider: password + TOTP; OIDC deferred). Unit tests may inject a fake authenticator; nothing
+else does. Role checks use ``core.permissions``. Tenant mutations carry an ``Idempotency-Key``
+header stored in ``form_token``; a second submit returns the first result. Foreign identifiers return 404 (MH-09).
 """
 
 from __future__ import annotations
@@ -11,19 +12,22 @@ import json
 import re
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any, Protocol
+from dataclasses import dataclass, field
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy import insert, select, text, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
-from core import audit, clock, jobs, keys, policy_store, tenancy, verification
+from console.auth import Authenticator, Principal, SessionAuthenticator, SignInLimits, origin_of
+from console.auth import register as register_auth
+from core import audit, clock, identity, jobs, keys, permissions, policy_store, reports, tenancy, verification
 from core.allowlist import AllowlistError, PublishRefused, RouteKey, listed
 from core.config import constants_hash
 from core.crypto import KeyService, encrypt_secret
+from core.mail import Mailer, MemoryMailer
 from core.models import (
     ApiKey,
     Binding,
@@ -31,41 +35,40 @@ from core.models import (
     FormToken,
     Project,
     ProviderConnection,
+    Report,
     RequestLog,
     Route,
 )
 from core.secretvalue import SecretValue
+from core.storage import MemoryObjectStore, ObjectStore, StorageError
 
 # Format check only. A host name is never evidence of location.
 AZURE_HOST = re.compile(
     r"^[a-z0-9][a-z0-9-]{1,62}\.(openai\.azure\.com|services\.ai\.azure\.com|cognitiveservices\.azure\.com)$"
 )
-WRITE_ROLES = frozenset({"owner", "engineer"})
+__all__ = ["Authenticator", "ConsoleServices", "Principal", "create_app"]
 
-
-@dataclass(frozen=True)
-class Principal:
-    user_id: uuid.UUID
-    tenant_id: uuid.UUID | None
-    role: str | None
-    is_operator: bool = False
-
-
-class Authenticator(Protocol):
-    def __call__(self, request: Request) -> Principal | None: ...
-
-
-def no_sign_in(request: Request) -> Principal | None:
-    """B1 default: single sign-on is not built, so nobody is admitted."""
-    return None
+SECURITY_HEADERS = {
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",  # ASVS 3.4.1
+    "X-Content-Type-Options": "nosniff",  # 3.4.4
+    "Referrer-Policy": "no-referrer",  # 3.4.5
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Cache-Control": "no-store",
+}
 
 
 @dataclass
 class ConsoleServices:
     factory: sessionmaker[Session]  # role mapleroute_console: tenant screens and API
     key_service: KeyService
-    authenticator: Authenticator = no_sign_in
+    authenticator: Authenticator | None = None  # None: the session cookie (production); tests may inject
     ops_factory: sessionmaker[Session] | None = None  # role mapleroute_operator: /ops routes only
+    mailer: Mailer = field(default_factory=MemoryMailer)
+    store: ObjectStore = field(default_factory=MemoryObjectStore)
+    public_base_url: str = "https://console.mapleroute.localhost"
+    limits: SignInLimits = field(default_factory=SignInLimits)
 
     def ops(self) -> sessionmaker[Session]:
         # Without an operator factory the console role is used, and the database refuses ops writes.
@@ -74,26 +77,47 @@ class ConsoleServices:
 
 def create_app(services: ConsoleServices) -> FastAPI:
     app = FastAPI(title="MapleRoute console", docs_url=None, redoc_url=None, openapi_url=None)
+    allowed_origin = origin_of(services.public_base_url)
+    authenticator: Authenticator = services.authenticator or SessionAuthenticator(services.factory, allowed_origin)
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next: Any) -> Response:
+        # A cross-origin unsafe request is refused before any route, signed in or not (sign-in CSRF, 3.5.1).
+        origin = request.headers.get("origin")
+        if request.method in ("POST", "PUT", "PATCH", "DELETE") and origin is not None and origin != allowed_origin:
+            response: Response = JSONResponse({"detail": "cross-origin request refused"}, status_code=403)
+        else:
+            response = await call_next(request)
+        for name, value in SECURITY_HEADERS.items():
+            response.headers.setdefault(name, value)
+        return response
 
     def principal(request: Request) -> Principal:
-        p = services.authenticator(request)
+        p = authenticator(request)
         if p is None:
             raise HTTPException(401, "sign-in required")
         return p
 
-    def tenant_member(request: Request, write: bool) -> Principal:
+    def tenant_member(request: Request, action: str) -> Principal:
         p = principal(request)
         if p.tenant_id is None or p.role is None:
             raise HTTPException(404, "not found")
-        if write and p.role not in WRITE_ROLES:
+        if not permissions.allowed(p.role, action):
             raise HTTPException(403, "role not permitted")
         return p
 
-    def operator(request: Request) -> Principal:
+    def operator(request: Request, sensitive: bool = False) -> Principal:
+        """Operator routes. Approve, suspend and resume also need a second factor and an authentication
+        under five minutes old (TRD.md "Operator sign-in", ASVS 6.8.4, 7.5.3)."""
         p = principal(request)
         if not p.is_operator:
             raise HTTPException(403, "operator only")
+        if sensitive and (not identity.has_mfa(p.amr) or not identity.recent_auth(p.auth_time, clock.now())):
+            raise HTTPException(401, "re-authentication required")
         return p
+
+    register_auth(app, factory=services.factory, key_service=services.key_service, mailer=services.mailer,
+                  limits=services.limits, public_base_url=services.public_base_url, principal=principal)
 
     def project_or_404(s: Session, pid: uuid.UUID) -> Project:
         project = s.get(Project, pid)  # row-level security hides other tenants' rows
@@ -132,14 +156,18 @@ def create_app(services: ConsoleServices) -> FastAPI:
         try:
             with services.factory() as s:
                 s.execute(text("SELECT 1"))
-            return JSONResponse({"status": "ok", "process": "console", "constants_hash": constants_hash()})
         except SQLAlchemyError:
             return JSONResponse({"status": "unavailable", "process": "console"}, status_code=503)
+        deps = {"database": "ok", "mail": "ok" if services.mailer.ping() else "unavailable",
+                "storage": "ok" if services.store.ping() else "unavailable"}
+        ok = all(v == "ok" for v in deps.values())
+        return JSONResponse({"status": "ok" if ok else "unavailable", "process": "console",
+                             "constants_hash": constants_hash(), "dependencies": deps}, status_code=200 if ok else 503)
 
     # ------------------------------------------------------------------ tenant API
     @app.post("/api/projects/{pid}/connections")
     def create_connection(pid: uuid.UUID, body: dict[str, Any], request: Request) -> dict[str, Any]:
-        p = tenant_member(request, write=True)
+        p = tenant_member(request, "connection.write")
         provider = body.get("provider")
         if provider not in ("aws", "azure"):
             raise HTTPException(422, "provider must be aws or azure")
@@ -174,7 +202,7 @@ def create_app(services: ConsoleServices) -> FastAPI:
 
     @app.post("/api/projects/{pid}/routes")
     def bind_route(pid: uuid.UUID, body: dict[str, Any], request: Request) -> dict[str, Any]:
-        p = tenant_member(request, write=True)
+        p = tenant_member(request, "route.write")
 
         def compute(s: Session) -> dict[str, Any]:
             project_or_404(s, pid)
@@ -216,7 +244,7 @@ def create_app(services: ConsoleServices) -> FastAPI:
 
     @app.post("/api/projects/{pid}/bindings/{bid}/verify")
     def request_verification(pid: uuid.UUID, bid: uuid.UUID, request: Request) -> dict[str, Any]:
-        p = tenant_member(request, write=True)
+        p = tenant_member(request, "route.write")
         token = request.headers.get("idempotency-key", "")
 
         def compute(s: Session) -> dict[str, Any]:
@@ -232,7 +260,7 @@ def create_app(services: ConsoleServices) -> FastAPI:
 
     @app.post("/api/projects/{pid}/keys")
     def create_key(pid: uuid.UUID, request: Request) -> dict[str, Any]:
-        p = tenant_member(request, write=True)
+        p = tenant_member(request, "key.write")
 
         def compute(s: Session) -> dict[str, Any]:
             project_or_404(s, pid)
@@ -249,7 +277,7 @@ def create_app(services: ConsoleServices) -> FastAPI:
 
     @app.delete("/api/projects/{pid}/keys/{kid}")
     def revoke_key(pid: uuid.UUID, kid: uuid.UUID, request: Request) -> dict[str, Any]:
-        p = tenant_member(request, write=True)
+        p = tenant_member(request, "key.write")
         with services.factory.begin() as s:
             assert p.tenant_id is not None
             tenancy.set_tenant(s, p.tenant_id)
@@ -264,7 +292,7 @@ def create_app(services: ConsoleServices) -> FastAPI:
 
     @app.get("/api/projects/{pid}/requests")
     def list_requests(pid: uuid.UUID, request: Request) -> dict[str, Any]:
-        p = tenant_member(request, write=False)
+        p = tenant_member(request, "request_log.read")
         with services.factory.begin() as s:
             assert p.tenant_id is not None
             tenancy.set_tenant(s, p.tenant_id)
@@ -278,6 +306,43 @@ def create_app(services: ConsoleServices) -> FastAPI:
                  "allowlist_version": r.allowlist_version, "state": r.state, "code": r.code, "flags": list(r.flags)}
                 for r in rows
             ]}
+
+    # ------------------------------------------------------------------ reports (stored files, B2)
+    @app.get("/api/reports")
+    def list_reports(request: Request) -> dict[str, Any]:
+        p = tenant_member(request, "report.read")
+        with services.factory.begin() as s:
+            assert p.tenant_id is not None
+            tenancy.set_tenant(s, p.tenant_id)
+            rows = s.execute(select(Report).where(Report.state == "ready")
+                             .order_by(Report.period_start.desc())).scalars().all()
+            base = services.public_base_url.rstrip("/")
+            return {"data": [
+                {"id": str(r.id), "kind": r.kind, "period_start": r.period_start.isoformat(),
+                 "period_end": r.period_end.isoformat(), "sha256": r.sha256.hex() if r.sha256 else None,
+                 # R-16: built from the one public base URL; the file endpoint needs the session.
+                 "file_url": f"{base}/api/reports/{r.id}/file"}
+                for r in rows
+            ]}
+
+    @app.get("/api/reports/{rid}/file")
+    def report_file(rid: uuid.UUID, request: Request) -> Response:
+        """The only way a stored file leaves: an authorised request by a member of the owning tenant."""
+        p = tenant_member(request, "report.read")
+        assert p.tenant_id is not None
+        try:
+            with services.factory.begin() as s:
+                tenancy.set_tenant(s, p.tenant_id)
+                row, data = reports.read_report(s, services.store, p.tenant_id, rid)
+                audit.record(s, p.tenant_id, "user", p.user_id, "report_download", str(rid))
+        except reports.ReportUnavailable as exc:
+            raise HTTPException(404, "not found") from exc
+        except StorageError as exc:
+            raise HTTPException(503, "report storage is unavailable") from exc
+        return Response(data, media_type=row.content_type or "application/octet-stream", headers={
+            "Content-Disposition": f'attachment; filename="mapleroute-report-{row.period_start}-{row.kind}.'
+                                   f'{(row.object_key or "x.bin").rsplit(".", 1)[-1]}"',
+            "X-Report-SHA256": row.sha256.hex() if row.sha256 else ""})
 
     # ------------------------------------------------------------------ operator API (/ops host in production)
     @app.post("/api/ops/allowlist/versions")
@@ -297,7 +362,7 @@ def create_app(services: ConsoleServices) -> FastAPI:
 
     @app.post("/api/ops/allowlist/versions/{version}/approve")
     def approve(version: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
-        p = operator(request)
+        p = operator(request, sensitive=True)
         if body.get("confirm") != version:
             raise HTTPException(422, "type the version to confirm")
         try:
@@ -312,7 +377,7 @@ def create_app(services: ConsoleServices) -> FastAPI:
 
     @app.post("/api/ops/routes/{route_id}/suspend")
     def suspend(route_id: str, request: Request) -> dict[str, Any]:
-        p = operator(request)
+        p = operator(request, sensitive=True)
         now = clock.now()
         with services.ops().begin() as s:
             changed = s.execute(
@@ -328,7 +393,7 @@ def create_app(services: ConsoleServices) -> FastAPI:
 
     @app.post("/api/ops/routes/{route_id}/resume")
     def resume(route_id: str, request: Request) -> dict[str, Any]:
-        p = operator(request)
+        p = operator(request, sensitive=True)
         try:
             with services.ops().begin() as s:
                 verification.resume_route(s, route_id, p.user_id, clock.now())

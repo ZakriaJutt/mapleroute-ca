@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from console.app import ConsoleServices, Principal
 from console.app import create_app as create_console
+from console.auth import SignInLimits
 from core import keys, policy_store
 from core.alerts import FakePager
 from core.crypto import FakeKeyService, encrypt_secret
@@ -26,9 +27,11 @@ from core.fakes import (
     FakeInference,
     canadian_profile,
 )
+from core.mail import Mailer, MemoryMailer
 from core.models import ApiKey, Binding, ConnectionSecret, Membership, Project, ProviderConnection, Tenant, UserAccount
 from core.providers import DeploymentAnswer, FoundationModelAnswer
 from core.secretvalue import SecretValue
+from core.storage import MemoryObjectStore, ObjectStore
 from core.verification import Applied
 from gateway.app import GatewayServices, RateLimiter
 from gateway.app import create_app as create_gateway
@@ -186,3 +189,14 @@ class World:
     def chat(client: TestClient, key: str, alias: str, **extra: Any) -> Any:
         body = {"model": alias, "messages": [{"role": "user", "content": "synthetic question"}], **extra}
         return client.post("/v1/chat/completions", json=body, headers={"Authorization": f"Bearer {key}"})
+
+    def session_console(self, mailer: Mailer | None = None, store: ObjectStore | None = None,
+                        limits: SignInLimits | None = None) -> TestClient:
+        """The console with the real session authenticator (B2). HTTPS base URL so the Secure cookie is sent."""
+        services = ConsoleServices(self.con, self.key_service, None, ops_factory=self.ops,
+                                   mailer=mailer or MemoryMailer(), store=store or MemoryObjectStore(),
+                                   public_base_url=CONSOLE_PUBLIC_URL, limits=limits or SignInLimits())
+        return TestClient(create_console(services), base_url="https://testserver")
+
+
+CONSOLE_PUBLIC_URL = "https://console.mapleroute.localhost"

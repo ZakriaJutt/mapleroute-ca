@@ -186,7 +186,9 @@ def test_b1_004_temp_table_cannot_shadow_verification_in_resume_guard(world: Wor
         funcs = s.execute(text(
             "SELECT p.proname, r.rolname, r.rolsuper, p.proconfig FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner "
             "WHERE p.prosecdef AND p.pronamespace = 'public'::regnamespace ORDER BY 1")).all()
-    assert [f[0] for f in funcs] == ["resolve_api_key", "route_resume_guard", "tenants_bound_to_route"]
+    # B2 adds the two sign-in lookups (memberships_for_user, accept_invitation), same owner and search path.
+    assert [f[0] for f in funcs] == ["accept_invitation", "memberships_for_user", "resolve_api_key",
+                                     "route_resume_guard", "tenants_bound_to_route"]
     for name, owner, is_super, config in funcs:
         assert owner == "mapleroute_definer" and not is_super, name
         assert config == ["search_path=pg_catalog, public, pg_temp"], name
