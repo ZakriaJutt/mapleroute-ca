@@ -75,7 +75,7 @@ Before writing a helper, search `core`. Region parsing, key hashing, object keys
 | Job table enqueue, claim, retry | `core.jobs` | |
 | Audit events | `core.audit` | |
 | Clock | `core.clock` | Tests set it |
-| Per-binding advisory lock (worker exclusive, gateway shared) | `core.locks` | Orders decisions against a mismatch being applied |
+| Per-binding advisory lock (worker exclusive, gateway shared); per-binding check lease (one check at a time, `CHECK_LEASE` timeout) | `core.locks` | Orders decisions against a mismatch being applied; checks of one binding never overlap (B1-003) |
 
 ### Commands
 

@@ -168,6 +168,36 @@ Independent code review `mapleroute-ca-b1-round1.md`: 0 blocker, 6 major, 5 mino
 
 **Commands after round 2** (from `mapleroute-ca/`): `make check` (ruff: all checks passed; mypy strict: no issues in 49 files; `import boundaries: OK`; `make test` on a re-migrated `mapleroute_test`: **101 passed, 0 failed**; `orm parity: OK`); `make smoke`: three services ok, exit 0. Reviewer's round-2 adversarial script, unchanged: **19 passed, 0 failed** (A1–A10 including A7 for each of four roles, N1–N5).
 
+### B1 fix round 3 (2026-11-11)
+
+**Reviewer's round-3 verdicts** (copied unchanged from `mapleroute-ca-b1-verdicts.json`, retest of commit `60ea225`; reproduced: `make test` 101 passed, orm parity OK, ruff clean, mypy strict clean (49 files), check-imports OK, smoke 3 services ok; adversarial 23 cases, 21 passed, 2 failed: R1, R3):
+
+| ID | Verdict |
+|---|---|
+| B1-001 | Closed |
+| B1-002 | Closed |
+| B1-003 | Still open: regression in the round-2 fix; a config_mismatch whose reads started before the verifying match's reads started is discarded even when it read the provider later, so the binding stays verified and a Global deployment is served unflagged until the next check (case R1; core/verification.py config_mismatch branch, `wins = observed >= verifying`) |
+| B1-004 | Closed |
+| B1-005 | Closed, part open: job unique key (kind, dedupe_key) is global, so the console role can take another tenant's scheduled-check key and suppress that check (case R3); needs direct database access and the other tenant's binding ID; bounded by the validity period; minor |
+| B1-006 | Closed |
+| B1-007 | Closed |
+| B1-008 | Closed |
+| B1-009 | Closed |
+| B1-010 | Closed |
+| B1-011 | Closed |
+| B1-012 | Closed, part open: older match finishing last no longer re-verifies (N3, R2 pass); the same start-of-reads ordering now discards a later-read mismatch, tracked as B1-003 |
+
+Reviewer's notes (unchanged): B1-007 residual risk (same-process code writing the private issue registry) judged acceptable. B1-009 to be rechecked when real adapters land. Round-2 adversarial count was 19 cases (17 passed, 2 failed), not 21.
+
+**This round's edits (author). Status of each: fixed after round-3 retest, awaiting recheck.** The design changed; results are no longer ordered by comparing timestamps of concurrent checks:
+
+| Finding | Fix | Regression test(s) | Status |
+|---|---|---|---|
+| B1-003 (and B1-012 open part) | Rule 1, serialised checks: migration `0005` adds `binding_check_lease`. `verify_binding` claims the binding's lease in its own committed transaction before the first provider read and releases it in the result transaction (`core.locks.claim_check` / `holds_check` / `release_check`). A second check while the lease is held is skipped (`skipped`, nothing recorded; the job raises `CheckInProgress` and is retried). A lease past `CHECK_LEASE` (2 minutes, `core.config`) is taken over; the old holder is fenced. Rule 2, asymmetric: any `config_mismatch` un-verifies and any `definition_mismatch` suspends, whatever its timing or lease, and sets `binding.last_mismatch_at` to when it was recorded; a `match` applies only if its check still holds the lease and started after `last_mismatch_at`. `binding.state_observed_at` is dropped; `verification.started_at` added; the route resume guard requires a match that started after the suspension and every later `definition_mismatch` | `tests/test_check_serialisation.py`: `test_r1_mismatch_read_after_the_verifying_match_unverifies` (R1), `test_r1_overlap_after_lease_expiry_mismatch_still_unverifies`, `test_n3_match_of_a_check_that_lost_its_lease_never_re_verifies`, `test_three_concurrent_checks_never_overlap` (three threads), `test_worker_dies_mid_check_lease_expires_then_checks_resume`, `test_mismatch_older_than_the_verifying_match_still_unverifies_and_flags`, `test_match_must_start_after_the_latest_recorded_mismatch`; `test_ut06_late_match_after_mismatch_leaves_route_suspended` updated. The three round-2 B1-012 tests in `test_round1_regressions.py` were replaced by these (their overlapping-check premise can no longer occur) | Fixed after round-3 retest, awaiting recheck |
+| B1-005 minor part | `job` unique key is now `(kind, tenant_id, dedupe_key)` NULLS NOT DISTINCT; check `ck_job_verify_key` requires a `verify_binding` job to have a tenant and a key starting with its payload's `binding_id`; the console insert policy allows only `<binding>:initial` and `<binding>:manual:<token>` for a binding visible in its own tenant, never a scheduled slot key | `test_console_cannot_create_or_squat_another_tenants_scheduled_key` (R3 squat); `test_b1_005_console_cannot_queue_jobs_for_other_tenants_or_kinds` updated to a valid manual key | Fixed after round-3 retest, awaiting recheck |
+
+**Commands after round 3** (from `mapleroute-ca/`): `make test` (re-migrates `mapleroute_test`): **106 passed, 0 failed**; `make orm-parity`: `orm parity: OK`; `make check-imports`: `import boundaries: OK`; `make lint` (ruff): all checks passed; `make typecheck` (mypy strict): no issues in 50 files; `make smoke`: gateway, console and worker ok, same constants hash (it changed because `CHECK_LEASE` joined the hashed constants). Reviewer's adversarial script, unchanged: **21 passed, 2 failed (N3, R2)**; R1 and R3 now pass. N3 and R2 fail by design: each starts a second and third check of the binding inside the first check's provider reads, in the same thread; under rule 1 those nested checks are skipped (`skipped`), so the assertions that expect them to run (`config_mismatch` / `match` results) cannot hold. The equivalent overlaps, now only possible after a lease expiry, are covered by `test_n3_match_of_a_check_that_lost_its_lease_never_re_verifies` and `test_r1_overlap_after_lease_expiry_mismatch_still_unverifies`. Not run: any check against real AWS or Azure.
+
 ## 3. Traceability of must-haves
 
 | MH | Screen or API | Decision | Schema or permission | Tasks | Planned tests |

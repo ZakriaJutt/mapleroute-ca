@@ -1,4 +1,7 @@
-"""Job table with FOR UPDATE SKIP LOCKED (AD-07). Unique (kind, dedupe_key): re-enqueue is a no-op."""
+"""Job table with FOR UPDATE SKIP LOCKED (AD-07).
+
+Unique (kind, tenant_id, dedupe_key): re-enqueue is a no-op, and keys are tenant-scoped (B1-005).
+"""
 
 from __future__ import annotations
 
@@ -26,7 +29,8 @@ def enqueue(session: Session, kind: str, dedupe_key: str, *, tenant_id: uuid.UUI
     if run_after is not None:
         values["run_after"] = run_after
     row = session.execute(
-        insert(Job).values(**values).on_conflict_do_nothing(constraint="uq_job_kind_dedupe").returning(Job.id)
+        insert(Job).values(**values)
+        .on_conflict_do_nothing(constraint="uq_job_kind_tenant_dedupe").returning(Job.id)
     ).first()
     return row[0] if row else None
 

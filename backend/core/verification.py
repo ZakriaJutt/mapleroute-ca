@@ -8,12 +8,19 @@ One outcome per kind of mismatch (TRD.md, AD-14):
   differs. The route's global status becomes ``suspended`` for every tenant.
 - ``access_failed`` / ``error``: nothing usable. No status change; the binding ages out. Never a pass.
 
-Ordering (R-01, B1-001, B1-003): ``checked_at`` is taken when the provider reads end, and the result
-is decided under the binding lock. A ``match`` is applied only if it is newer than the stored check,
-so a late match can never re-verify anything. A mismatch is always applied: un-verifying or
-suspending is never unsafe. The window flagged on a mismatch starts at the start of the reads of the
-last matching check and has no upper bound. A binding is ``verified`` only when L2 (the
-customer-side deny policy) was read in place at that same check.
+Ordering (R-01, B1-001, B1-003, B1-012): two rules, not timestamps alone.
+1. Serialised: at most one check of a binding runs at a time; it holds the binding's check lease
+   (``core.locks``, table ``binding_check_lease``) from before its first provider read until its
+   result is recorded. A second check is skipped. A lease past ``CHECK_LEASE`` is taken over.
+2. Asymmetric: any mismatch that arrives, whatever its timing and whether or not its check still
+   holds the lease, un-verifies the binding (``config_mismatch``) or suspends the route
+   (``definition_mismatch``), and moves the binding's ``last_mismatch_at`` to when it was recorded.
+   A binding returns to ``verified`` only through a match whose check still holds the lease and
+   STARTED after ``last_mismatch_at``.
+``checked_at`` is the end of the reads; the result is decided under the binding lock. The window
+flagged on a mismatch starts at the earlier of the last verification and the start of the latest
+match that started before the mismatch's reads, and has no upper bound. A binding is ``verified``
+only when L2 (the customer-side deny policy) was read in place at that same check.
 """
 
 from __future__ import annotations
@@ -172,20 +179,27 @@ class Applied:
 
 
 def apply_outcome(session: Session, binding: Binding, outcome: CheckOutcome, checked_at: datetime,
-                  allowlist_version: str, pager: alerts.Pager,
-                  reads_started_at: datetime | None = None) -> Applied:
+                  allowlist_version: str, pager: alerts.Pager, *, reads_started_at: datetime | None = None,
+                  holds_lease: bool, recorded_at: datetime | None = None) -> Applied:
     """Record the verification row and apply its effect. Caller holds the tenant context, the
     binding advisory lock and the binding row lock (SELECT ... FOR UPDATE).
 
-    ``reads_started_at``..``checked_at`` is the interval in which the provider was read.
+    ``reads_started_at``..``checked_at`` is the interval in which the provider was read;
+    ``holds_lease`` says whether this check still holds the binding's check lease (core.locks);
+    ``recorded_at`` is when the result arrives (defaults to ``checked_at``).
+
+    Asymmetric rule (B1-003): a mismatch always applies, whatever its timing or lease, and moves the
+    binding's mismatch fence (``last_mismatch_at``) to when it was recorded. A match applies only if
+    this check still holds the lease and started after the fence.
     """
     started = reads_started_at or checked_at
+    recorded = max(recorded_at or checked_at, checked_at)
     answer = {**outcome.provider_answer,
               "coverage": {"reads_started_at": started.isoformat(), "reads_ended_at": checked_at.isoformat()}}
     session.add(
         Verification(
             tenant_id=binding.tenant_id, binding_id=binding.id, route_id=binding.route_id, checked_at=checked_at,
-            result=outcome.result, reason=outcome.reason, provider_answer=answer,
+            started_at=started, result=outcome.result, reason=outcome.reason, provider_answer=answer,
             allowlist_version=allowlist_version, grade=outcome.grade,
         )
     )
@@ -198,49 +212,42 @@ def apply_outcome(session: Session, binding: Binding, outcome: CheckOutcome, che
             )
         )
     session.flush()
-    # Ordering is by observation (start of the reads), never by when a check finished (B1-012).
-    observed = started
-    behind = binding.state_observed_at
     if binding.last_checked_at is None or checked_at > binding.last_checked_at:
         binding.last_checked_at = checked_at
+    fence = binding.last_mismatch_at
     connection = session.get(ProviderConnection, binding.connection_id)
     if outcome.result == "match":
-        if behind is not None and observed <= behind:
+        if not holds_lease or (fence is not None and started <= fence):
             session.flush()
-            return Applied("match", applied=False)  # older observation: recorded, never applied (R-01)
+            return Applied("match", applied=False)  # recorded, never applied (R-01, B1-003)
         binding.status = "verified"
         # Validity and the next window start from the start of the reads (conservative).
-        binding.last_verified_at = observed
-        binding.l2_confirmed_at = observed
-        binding.state_observed_at = observed
+        binding.last_verified_at = started
+        binding.l2_confirmed_at = started
         binding.provider_modified_at = outcome.provider_modified_at
         if connection is not None and connection.state != "deleted":
             connection.state, connection.last_read_ok_at = "connected", checked_at
         session.flush()
         return Applied("match", True)
+    if outcome.result in ("config_mismatch", "definition_mismatch"):
+        binding.last_mismatch_at = recorded if fence is None else max(fence, recorded)
     if outcome.result == "config_mismatch":
-        verifying = binding.last_verified_at if binding.status == "verified" else None
-        # A mismatch observed at or after the observation that verified the binding always wins.
-        wins = verifying is None or observed >= verifying
-        since = prior_match_observation(session, binding.id, observed) or binding.last_verified_at
-        if wins:
-            binding.status = "unverified"
-            if behind is None or observed >= behind:
-                binding.state_observed_at = observed
-                if outcome.provider_modified_at is not None:
-                    binding.provider_modified_at = outcome.provider_modified_at  # baseline for the next check
+        # Window start: the start of the latest match whose reads started before this check's reads.
+        starts = [t for t in (prior_match_observation(session, binding.id, started), binding.last_verified_at)
+                  if t is not None]
+        since = min(starts) if starts else None
+        binding.status = "unverified"  # always: a mismatch is never discarded (B1-003)
+        if holds_lease and outcome.provider_modified_at is not None:
+            binding.provider_modified_at = outcome.provider_modified_at  # baseline for the next check
         session.flush()
-        # Served requests are flagged either way: the deployment was seen mismatching after `since`.
         flagged = flag_window(session, binding, since) if since is not None else 0
         raised = alerts.raise_alert(
             session, binding.tenant_id, "config_mismatch", f"config_mismatch:{binding.id}:{since}",
             {"binding_id": str(binding.id), "route_id": binding.route_id, "reason": outcome.reason,
              "flagged_requests": flagged},
         )
-        return Applied("config_mismatch", wins, flagged_requests=flagged, alert_raised=raised)
+        return Applied("config_mismatch", True, flagged_requests=flagged, alert_raised=raised)
     if outcome.result == "definition_mismatch":
-        if behind is None or observed > behind:
-            binding.state_observed_at = observed  # an older match can no longer re-verify past it
         suspended = suspend_route(session, binding.route_id, checked_at, outcome.reason or "destinations_differ")
         if suspended:
             jobs.enqueue(session, "notify_route_suspended", f"{binding.route_id}:{checked_at.isoformat()}",
@@ -322,27 +329,22 @@ def lookback_start(session: Session, binding_id: uuid.UUID) -> datetime | None:
     period it did not read stays open until a completed check covers it.
     """
     row = session.execute(
-        select(Verification.provider_answer, Verification.checked_at)
+        select(Verification.started_at, Verification.checked_at)
         .where(Verification.binding_id == binding_id, Verification.result.in_(COMPLETED_RESULTS))
         .order_by(Verification.checked_at.desc()).limit(1)
     ).first()
     if row is None:
         return None
-    started = (row.provider_answer or {}).get("coverage", {}).get("reads_started_at")
-    return datetime.fromisoformat(started) if started else row.checked_at
+    started: datetime | None = row[0]
+    checked: datetime = row[1]
+    return started or checked
 
 
 def prior_match_observation(session: Session, binding_id: uuid.UUID, before: datetime) -> datetime | None:
-    """Observation time of the latest matching check observed before ``before`` (window start)."""
-    rows = session.execute(
-        select(Verification.provider_answer, Verification.checked_at)
-        .where(Verification.binding_id == binding_id, Verification.result == "match")
-        .order_by(Verification.checked_at.desc()).limit(50)
-    ).all()
-    starts = []
-    for answer, checked in rows:
-        raw = (answer or {}).get("coverage", {}).get("reads_started_at")
-        started = datetime.fromisoformat(raw) if raw else checked
-        if started < before:
-            starts.append(started)
-    return max(starts) if starts else None
+    """Start of the reads of the latest matching check whose reads started before ``before``."""
+    latest: datetime | None = session.execute(
+        select(func.max(Verification.started_at))
+        .where(Verification.binding_id == binding_id, Verification.result == "match",
+               Verification.started_at < before)
+    ).scalar_one_or_none()
+    return latest

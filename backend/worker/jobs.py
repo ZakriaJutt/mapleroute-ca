@@ -34,10 +34,13 @@ class WorkerServices:
 
 def verify_binding(session: Session, services: WorkerServices, tenant_id: uuid.UUID, binding_id: uuid.UUID,
                    now: datetime) -> verification.Applied:
-    """Read the provider, then lock the binding and apply (B1-001, B1-002, B1-003).
+    """Claim the binding's check lease, read the provider, then lock the binding and apply
+    (B1-001, B1-002, B1-003).
 
-    ``now`` is when the job started. The reads run without holding the binding lock; ``checked_at``
-    is the end of the reads; the result is decided only after the lock is held.
+    ``now`` is when the job started. At most one check of a binding runs at a time: if another check
+    holds the lease, this one is skipped (result ``skipped``, nothing recorded). The reads run under
+    the lease but without the binding lock; ``checked_at`` is the end of the reads; the result is
+    decided only after the binding lock is held, and the lease is released in the same transaction.
     """
     tenancy.set_tenant(session, tenant_id)
     binding = session.execute(select(Binding).where(Binding.id == binding_id)).scalar_one()
@@ -74,20 +77,37 @@ def verify_binding(session: Session, services: WorkerServices, tenant_id: uuid.U
         return verification.check_azure(key, target_az, services.azure_reader, binding.provider_modified_at,
                                          lookback)
 
-    # The activity look-back starts at the last check whose reads completed, never at a failed one.
-    lookback = verification.lookback_start(session, binding.id) or binding.last_verified_at
-    reads_started = min(now, clock.now())
-    outcome = verification.guarded(run)
-    checked_at = max(now, clock.now())  # coverage ends when the reads end
+    lease = locks.claim_check(session, tenant_id, binding_id, clock.now())
+    if lease is None:  # another check of this binding is running: never overlap (B1-003)
+        log_event("verification_skipped", tenant_id=tenant_id, binding_id=binding_id, route_id=route.id,
+                  status="skipped")
+        return verification.Applied("skipped", applied=False)
+    try:
+        # The activity look-back starts at the last check whose reads completed, never at a failed one.
+        lookback = verification.lookback_start(session, binding.id) or binding.last_verified_at
+        reads_started = min(now, lease.started_at)
+        outcome = verification.guarded(run)
+        checked_at = max(now, clock.now())  # coverage ends when the reads end
+    except BaseException:
+        locks.release_check_detached(session, tenant_id, lease)
+        raise
     locks.binding_lock(session, binding.project_id, binding.alias, shared=False)
     binding = session.execute(
         select(Binding).where(Binding.id == binding_id).with_for_update().execution_options(populate_existing=True)
     ).scalar_one()
+    holds = locks.holds_check(session, lease)  # false if the lease expired and another check took it
     applied = verification.apply_outcome(session, binding, outcome, checked_at, version, services.pager,
-                                         reads_started_at=reads_started)
+                                         reads_started_at=reads_started, holds_lease=holds,
+                                         recorded_at=clock.now())
+    if holds:
+        locks.release_check(session, lease)
     log_event("verification_applied", tenant_id=tenant_id, binding_id=binding_id, route_id=route.id,
               result=outcome.result, reason=outcome.reason, status="applied" if applied.applied else "stale")
     return applied
+
+
+class CheckInProgress(RuntimeError):
+    """A verify_binding job found another check of the binding running; the job is retried later."""
 
 
 def schedule_verifications(session: Session, now: datetime) -> int:
@@ -130,7 +150,9 @@ def notify_route_suspended(session: Session, payload: dict[str, Any]) -> int:
 def run_job(session: Session, services: WorkerServices, job: Job, now: datetime) -> None:
     if job.kind == "verify_binding":
         assert job.tenant_id is not None
-        verify_binding(session, services, job.tenant_id, uuid.UUID(job.payload["binding_id"]), now)
+        applied = verify_binding(session, services, job.tenant_id, uuid.UUID(job.payload["binding_id"]), now)
+        if applied.result == "skipped":
+            raise CheckInProgress("check_in_progress")
     elif job.kind == "notify_route_suspended":
         notify_route_suspended(session, job.payload)
     else:

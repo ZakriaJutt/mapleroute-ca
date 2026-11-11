@@ -274,8 +274,8 @@ class Binding(Base):
     last_checked_at: Mapped[datetime | None] = mapped_column(TS)
     l2_confirmed_at: Mapped[datetime | None] = mapped_column(TS)
     provider_modified_at: Mapped[datetime | None] = mapped_column(TS)
-    # Start of the reads of the result behind the current state; orders results by observation (B1-012).
-    state_observed_at: Mapped[datetime | None] = mapped_column(TS)
+    # When the latest mismatch was recorded. A match re-verifies only if its check started after it (B1-003).
+    last_mismatch_at: Mapped[datetime | None] = mapped_column(TS)
     created_at: Mapped[datetime] = _created()
     __table_args__ = (
         ForeignKeyConstraint(
@@ -308,6 +308,8 @@ class Verification(Base):
     binding_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     route_id: Mapped[str] = mapped_column(Text, ForeignKey("route.id"), nullable=False)
     checked_at: Mapped[datetime] = mapped_column(TS, nullable=False)
+    # Start of the provider reads (B1-003); NULL only on rows not written by the worker.
+    started_at: Mapped[datetime | None] = mapped_column(TS)
     result: Mapped[str] = mapped_column(Text, nullable=False)
     reason: Mapped[str | None] = mapped_column(Text)
     provider_answer: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
@@ -325,6 +327,7 @@ class Verification(Base):
             name="ck_verification_result",
         ),
         CheckConstraint("grade IN ('EG-3', 'EG-4')", name="ck_verification_grade"),
+        CheckConstraint("started_at IS NULL OR started_at <= checked_at", name="ck_verification_started"),
         Index("ix_verification_binding_checked", "tenant_id", "binding_id", text("checked_at DESC")),
         Index(
             "ix_verification_route_match", "route_id", "checked_at", postgresql_where=text("result = 'match'")
@@ -464,6 +467,32 @@ class Job(Base):
     created_at: Mapped[datetime] = _created()
     __table_args__ = (
         CheckConstraint("state IN ('queued', 'running', 'done', 'failed')", name="ck_job_state"),
-        UniqueConstraint("kind", "dedupe_key", name="uq_job_kind_dedupe"),
+        # Tenant-scoped key: one tenant cannot squat another tenant's key (B1-005 part).
+        UniqueConstraint("kind", "tenant_id", "dedupe_key", name="uq_job_kind_tenant_dedupe",
+                         postgresql_nulls_not_distinct=True),
+        CheckConstraint(
+            "kind <> 'verify_binding' OR (tenant_id IS NOT NULL AND payload ? 'binding_id' "
+            "AND starts_with(dedupe_key, (payload ->> 'binding_id') || ':'))",
+            name="ck_job_verify_key",
+        ),
         Index("ix_job_queued", "run_after", postgresql_where=text("state = 'queued'")),
+    )
+
+
+class BindingCheckLease(Base):
+    """At most one check of a binding at a time (B1-003). Claimed before the first provider read,
+    released with the result; a lease past ``expires_at`` may be taken over."""
+
+    __tablename__ = "binding_check_lease"
+    binding_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    holder: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(TS, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(TS, nullable=False)
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "binding_id"], ["binding.tenant_id", "binding.id"], name="fk_check_lease_binding",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint("expires_at > started_at", name="ck_check_lease_expiry"),
     )

@@ -117,10 +117,13 @@ erDiagram
 | | `last_verified_at`, `last_checked_at` | timestamptz | yes | request path requires `last_verified_at` within the validity period: 24 hours for `aws`, 1 hour for `azure` |
 | | `l2_confirmed_at` | timestamptz | yes | `status = 'verified'` requires it not null (check) |
 | | `provider_modified_at` | timestamptz | yes | Azure deployment's last-modified time at the last matching check |
-| | `state_observed_at` | timestamptz | yes | Start of the provider reads of the result behind the current status (B1 fix round 2, B1-012); a result changes the binding only if it observed later |
+| | `last_mismatch_at` | timestamptz | yes | When the latest `config_mismatch` or `definition_mismatch` for this binding was recorded (B1 fix round 3, migration `0005`, B1-003); a `match` re-verifies only if its check started after it. Replaces round 2's `state_observed_at` |
+| `binding_check_lease` T | `binding_id` | uuid | no | primary key; foreign key (`tenant_id`, `binding_id`) to `binding`, on delete cascade (B1 fix round 3, B1-003) |
+| | `holder`, `started_at`, `expires_at` | uuid, timestamptz, timestamptz | no | check `expires_at > started_at`. One row = one check running. Claimed in its own committed transaction before the first provider read; released in the result transaction; taken over only when `expires_at` has passed (`CHECK_LEASE`, 2 minutes). Row-level security by tenant; worker only |
 | `verification` T | `binding_id` | uuid | no | append-only |
 | | `route_id` | text | no | references `route`; the route compared at this check (added in B1 so the resume rule reads matches per route) |
-| | `checked_at` | timestamptz | no | — |
+| | `checked_at` | timestamptz | no | end of the provider reads |
+| | `started_at` | timestamptz | yes | start of the provider reads (fix round 3); check `started_at <= checked_at`. Null only on rows not written by the worker; such a row never re-verifies a binding or justifies a resume |
 | | `result` | text | no | check in (`match`, `config_mismatch`, `definition_mismatch`, `access_failed`, `error`). `config_mismatch` changes one binding; `definition_mismatch` changes `route.global_status` |
 | | `reason` | text | yes | e.g. `sku_not_eligible`, `deployment_recreated`, `l2_missing`, `role_too_broad`, `logging_outside_canada`, `destinations_differ` |
 | | `provider_answer` | jsonb | no | identifiers, Regions, `sku.name`, location, model and version, timestamps, policy assignment IDs only |
@@ -177,7 +180,7 @@ Check: `state <> 'rejected'` requires `route_id` and `allowlist_version`. Allowe
 | `watcher_snapshot` | `provider`, `source_url`, `fetched_at`, `sha256`, `extracted` | mixed | no | unique (`provider`, `source_url`, `sha256`) |
 | `watcher_diff` | `from_snapshot`, `to_snapshot`, `summary`, `reviewed_by`, `reviewed_at`, `resulting_version` | mixed | mixed | — |
 | `map_inquiry` | `name`, `email`, `message`, `consent_text_version` | text | no | purged after 6 months |
-| `job` | `kind`, `dedupe_key`, `tenant_id`, `run_after`, `state`, `attempts`, `locked_at`, `last_error_code`, `correlation_id` | mixed | mixed | unique (`kind`, `dedupe_key`); `state` check in (`queued`, `running`, `done`, `failed`) |
+| `job` | `kind`, `dedupe_key`, `tenant_id`, `run_after`, `state`, `attempts`, `locked_at`, `last_error_code`, `correlation_id` | mixed | mixed | unique nulls not distinct (`kind`, `tenant_id`, `dedupe_key`) (fix round 3, B1-005 part); check `ck_job_verify_key`: a `verify_binding` job has a tenant and its key starts with its payload's `binding_id`; `state` check in (`queued`, `running`, `done`, `failed`) |
 
 ## Indexes and their queries
 
@@ -193,7 +196,7 @@ Check: `state <> 'rejected'` requires `route_id` and `allowlist_version`. Allowe
 | `alert (tenant_id, created_at desc) where acknowledged_at is null` | S-09 open alerts |
 | `job (run_after) where state = 'queued'` | Worker claim with `FOR UPDATE SKIP LOCKED` |
 | `binding (route_id)` | Tenants affected by a route suspension (operator role) |
-| `verification (route_id, checked_at) where result = 'match'` partial | Resume rule: a match newer than the suspension (added in B1) |
+| `verification (route_id, checked_at) where result = 'match'` partial | Resume rule: a match whose reads started after the suspension (added in B1; `started_at` since fix round 3) |
 
 ## Roles and permissions
 
@@ -210,9 +213,9 @@ Check: `state <> 'rejected'` requires `route_id` and `allowlist_version`. Allowe
 **SECURITY DEFINER functions (three).** All are owned by `mapleroute_definer` (NOLOGIN, NOSUPERUSER, NOBYPASSRLS; it reads through `FOR SELECT TO mapleroute_definer` policies on exactly the columns it needs), set `search_path = pg_catalog, public, pg_temp` (temporary schema last), qualify every relation with `public.`, and are not executable by PUBLIC:
 - `resolve_api_key(hash)`: key ID, tenant, project and state for one hash, because the gateway learns the tenant from the key. Executable by the gateway only.
 - `tenants_bound_to_route(route)`: tenant IDs only, for suspension alerts and the 7-day removal rule. Executable by the worker and operator.
-- `route_resume_guard()`: the trigger on `route`. Refuses `suspended` → `active` unless the session user is the operator role **and** a `verification` row with `result = 'match'` newer than the suspension exists for that route.
+- `route_resume_guard()`: the trigger on `route`. Refuses `suspended` → `active` unless the session user is the operator role **and** a `verification` row with `result = 'match'` whose `started_at` is after the suspension and after every later `definition_mismatch` on that route exists (fix round 3).
 
-**`job` row-level security (fix round 2, B1-005 part).** `job` is FORCE ROW LEVEL SECURITY: the worker sees all rows; the console may insert and see only `verify_binding` jobs for its own tenant; the operator only tenant-less `notify_route_suspended` jobs. A tenant session cannot queue work or alerts for another tenant.
+**`job` row-level security (fix round 2, B1-005 part).** `job` is FORCE ROW LEVEL SECURITY: the worker sees all rows; the console may insert and see only `verify_binding` jobs for its own tenant; the operator only tenant-less `notify_route_suspended` jobs. A tenant session cannot queue work or alerts for another tenant. Fix round 3: the console may insert only the keys `<binding>:initial` and `<binding>:manual:<token>`, never a scheduled slot `<binding>:<slot>`, and only for a binding of its own tenant (the policy reads `binding` under its own row-level security); with the tenant-scoped unique key, no row of one tenant can collide with another tenant's key.
 
 `verification` carries a composite foreign key (`tenant_id`, `binding_id`, `route_id`) to `binding` (`tenant_id`, `id`, `route_id`), so a check can only be recorded against its binding's route.
 
@@ -232,11 +235,12 @@ Application roles map to rights as in [PRD.md](PRD.md#users-and-roles) and are e
 | Request decision | Insert `request_log` in its own committed transaction before forwarding | One row per request ID |
 | Completion | Single update with `where state = 'forwarding'` | Second writer changes nothing |
 | Publish allow-list | One transaction: validate, set previous `superseded`, set new `active`, write `allowlist_route`, audit | Partial unique index refuses two active |
-| Verify binding (`match`) | Under the binding lock, update that binding only if the check's observation (start of its reads) is later than `state_observed_at`; `last_verified_at` and `state_observed_at` become that observation | A match that observed earlier is recorded, never applied, however late it finishes (R-01, B1-012) |
+| Check one binding | Claim `binding_check_lease` (own committed transaction) before any provider read; record the result and release the lease in one transaction under the binding advisory lock and row lock | A second check while the lease is held is skipped and its job retried; an expired lease is taken over, and the old holder is fenced (B1-003) |
+| Verify binding (`match`) | Under the binding lock, verify only if this check still holds its lease and its `started_at` is after `last_mismatch_at`; `last_verified_at` becomes `started_at` | Otherwise recorded, never applied, however late it finishes (R-01, B1-003, B1-012) |
 | Suspend route (`definition_mismatch`) | Update `where global_status = 'active'`, however late the result | Suspending is never unsafe; only resume is guarded |
-| Un-verify binding (`config_mismatch`) | Under the binding lock, set `unverified` whenever the mismatch observed at or after the observation that verified the binding; flag every served request since the latest matching observation before it, with no upper bound. A mismatch observed before a newer verifying match leaves the status but still flags | Never discarded as late (B1-003, B1-012); flagging is idempotent |
+| Un-verify binding (`config_mismatch`) | Under the binding lock, always set `unverified` and move `last_mismatch_at` to when the result was recorded, whatever its timing or lease; flag every served request since the earlier of `last_verified_at` and the start of the latest match that started before the mismatch's reads, with no upper bound | Never discarded (B1-003); flagging is idempotent |
 | Console mutations | Transaction plus `form_token` | Second submit returns first result |
-| Jobs | Unique (`kind`, `dedupe_key`) | Re-enqueue is a no-op |
+| Jobs | Unique (`kind`, `tenant_id`, `dedupe_key`) | Re-enqueue is a no-op; keys are tenant-scoped |
 | Reconciliation | Upsert on `provider_event_id` | Replay-safe |
 
 ## Sensitivity and retention

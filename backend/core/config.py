@@ -26,6 +26,10 @@ CLASSES: dict[str, frozenset[str]] = {
 # Validity of the last matching check; the worst-case bound, not the interval.
 VALIDITY: dict[str, timedelta] = {"aws": timedelta(hours=24), "azure": timedelta(hours=1)}
 CHECK_INTERVAL: dict[str, timedelta] = {"aws": timedelta(hours=6), "azure": timedelta(minutes=15)}
+# One check of a binding at a time (B1-003): a check holds the binding's lease for its whole run,
+# provider reads included. A lease older than this is taken over (a dead worker cannot block), so
+# every provider read timeout must be well below it.
+CHECK_LEASE = timedelta(minutes=2)
 # Consecutive failed checks that raise an access_failed alert (TRD.md residual window).
 FAILED_CHECKS_ALERT_THRESHOLD = 2
 # sweep_outcomes moves rows in `forwarding` older than this to `unknown_outcome`.
@@ -50,6 +54,7 @@ def constants_hash() -> str:
         "interval": {k: v.total_seconds() for k, v in CHECK_INTERVAL.items()},
         "failed_alert": FAILED_CHECKS_ALERT_THRESHOLD,
         "sweep": FORWARDING_SWEEP_AFTER.total_seconds(),
+        "check_lease": CHECK_LEASE.total_seconds(),
         "unsupported": sorted(UNSUPPORTED_PARAMETERS),
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()

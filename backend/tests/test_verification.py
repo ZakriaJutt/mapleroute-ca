@@ -154,7 +154,8 @@ def test_ut06_late_match_after_mismatch_leaves_route_suspended(world: World) -> 
     with world.app.begin() as s:
         s.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": str(a.tenant_id)})
         row = s.execute(select(Binding).where(Binding.id == ba).with_for_update()).scalar_one()
-        applied = apply_outcome(s, row, CheckOutcome("match"), late_at, "2026.11.10-1", world.pager)
+        applied = apply_outcome(s, row, CheckOutcome("match"), late_at, "2026.11.10-1", world.pager,
+                                holds_lease=True)  # started before the recorded mismatch (B1-003)
     assert applied.applied is False
     assert route(world, HAIKU).global_status == "suspended"
     assert binding(world, ba).last_checked_at == world.clock.t.replace(hour=10, minute=0)
