@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy import delete, insert, select, text, update
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from core import audit, clock, identity, local_idp, permissions, tenancy
@@ -100,9 +101,25 @@ def clear_session_cookie(response: Response) -> None:
     response.delete_cookie(SESSION_COOKIE, path="/", secure=True, httponly=True, samesite="lax")
 
 
-def _client(request: Request) -> str:
-    # The direct peer only; forwarded headers are not trusted (no proxy in front locally).
-    return request.client.host if request.client else "unknown"
+FORWARDING_HEADERS = ("forwarded", "x-forwarded-for", "x-real-ip")
+
+
+def client_key(request: Request, trusted_proxies: frozenset[str]) -> str:
+    """The address a rate-limit window is keyed on (B2-S02).
+
+    With no trusted proxy configured (the default), console/main.py runs uvicorn with
+    ``proxy_headers=False``, so ``request.client`` is the direct peer. Because the app may also be
+    served by a server that rewrites the client from forwarding headers, a request that carries such a
+    header from an untrusted source shares one window, whatever the header says: rotating it cannot
+    buy new windows. With trusted proxies configured, uvicorn rewrites the client only for those peers
+    (``forwarded_allow_ips``) and the rewritten address is used.
+    """
+    peer = request.client.host if request.client else "unknown"
+    if trusted_proxies:
+        return peer
+    if any(h in request.headers for h in FORWARDING_HEADERS):
+        return "untrusted-forwarded"
+    return peer
 
 
 def _str(body: dict[str, Any], key: str, max_len: int = 256) -> str:
@@ -113,8 +130,26 @@ def _str(body: dict[str, Any], key: str, max_len: int = 256) -> str:
 
 
 def register(app: FastAPI, *, factory: sessionmaker[Session], key_service: KeyService, mailer: Mailer,
-             limits: SignInLimits, public_base_url: str, principal: Callable[[Request], Principal]) -> None:
+             limits: SignInLimits, public_base_url: str, principal: Callable[[Request], Principal],
+             trusted_proxies: frozenset[str] = frozenset()) -> None:
     """Add the /auth routes, onboarding and member management to the console app."""
+
+    def _client(request: Request) -> str:
+        return client_key(request, trusted_proxies)
+
+    def audit_after(tenant_id: uuid.UUID | None, user_id: uuid.UUID, action: str, detail: dict[str, Any]) -> None:
+        """Audit an action that has already been committed (B2-S01). Tenant context is set for the
+        insert; a failure is retried once, then logged, and never undoes the committed action."""
+        for attempt in (1, 2):
+            try:
+                with factory.begin() as s:
+                    if tenant_id is not None:
+                        tenancy.set_tenant(s, tenant_id)
+                    audit.record(s, tenant_id, "user", user_id, action, str(user_id), detail)
+                return
+            except SQLAlchemyError:
+                if attempt == 2:
+                    log_event("audit_failed", reason=action, tenant_id=tenant_id)
 
     def session_response(body: dict[str, Any], new: NewSession | tuple[str, str], status: int = 200) -> JSONResponse:
         token, csrf = (new.token, new.csrf_token) if isinstance(new, NewSession) else new
@@ -164,7 +199,8 @@ def register(app: FastAPI, *, factory: sessionmaker[Session], key_service: KeySe
         try:
             with factory.begin() as s:
                 done = local_idp.complete_enrolment(s, key_service, token, name, password, now)
-        except local_idp.LinkInvalid as exc:
+        except (local_idp.LinkInvalid, IntegrityError) as exc:
+            # IntegrityError: a concurrent completion for the same address won the unique credential.
             raise HTTPException(400, "this link is not valid; it may have expired or been used") from exc
         except PasswordRejected as exc:
             raise HTTPException(422, str(exc)) from exc
@@ -235,9 +271,10 @@ def register(app: FastAPI, *, factory: sessionmaker[Session], key_service: KeySe
     def logout(request: Request) -> Response:
         p = signed_in(request)
         assert p.session_id is not None
+        # 7.4.1: the session is deleted and committed first; the audit event follows and cannot undo it.
         with factory.begin() as s:
             identity.end_session(s, p.session_id)
-            audit.record(s, p.tenant_id, "user", p.user_id, "sign_out", str(p.user_id))
+        audit_after(p.tenant_id, p.user_id, "sign_out", {})
         resp = Response(status_code=204)
         clear_session_cookie(resp)
         return resp
@@ -246,8 +283,8 @@ def register(app: FastAPI, *, factory: sessionmaker[Session], key_service: KeySe
     def logout_all(request: Request) -> Response:
         p = signed_in(request)
         with factory.begin() as s:
-            identity.end_all_sessions(s, p.user_id)
-            audit.record(s, p.tenant_id, "user", p.user_id, "sign_out_all", str(p.user_id))
+            ended = identity.end_all_sessions(s, p.user_id)
+        audit_after(p.tenant_id, p.user_id, "sign_out_all", {"sessions_ended": ended})
         resp = Response(status_code=204)
         clear_session_cookie(resp)
         return resp
@@ -365,8 +402,12 @@ def register(app: FastAPI, *, factory: sessionmaker[Session], key_service: KeySe
             raise HTTPException(503, "mail is unavailable; try again later") from exc
         return {"id": str(mid), "role": role, "state": "invited", "invite_expires_at": expires.isoformat()}
 
-    def _owners_left(s: Session, excluding: uuid.UUID) -> int:
-        return len([r for r in member_rows(s) if r.role == "owner" and r.user_id is not None and r.id != excluding])
+    def _lock_owners(s: Session) -> list[uuid.UUID]:
+        """Lock every owner row of the tenant before reading or changing a member (B2-S04). Concurrent
+        demotions or removals queue on these locks, and the later one reads the owners as the earlier one
+        committed them, so a race can never leave a tenant without an owner."""
+        return list(s.execute(select(Membership.id).where(Membership.role == "owner", Membership.user_id.is_not(None))
+                              .order_by(Membership.id).with_for_update()).scalars().all())
 
     @app.patch("/api/members/{mid}")
     def change_role(mid: uuid.UUID, body: dict[str, Any], request: Request) -> dict[str, Any]:
@@ -377,10 +418,11 @@ def register(app: FastAPI, *, factory: sessionmaker[Session], key_service: KeySe
             raise HTTPException(422, "role must be owner, engineer or reviewer")
         with factory.begin() as s:
             tenancy.set_tenant(s, p.tenant_id)
+            owners = _lock_owners(s)
             row = s.get(Membership, mid)
             if row is None:
                 raise HTTPException(404, "not found")
-            if row.role == "owner" and role != "owner" and _owners_left(s, mid) == 0:
+            if row.role == "owner" and role != "owner" and not [o for o in owners if o != mid]:
                 raise HTTPException(409, "an organisation keeps at least one owner")
             s.execute(update(Membership).where(Membership.id == mid).values(role=role))
             audit.record(s, p.tenant_id, "user", p.user_id, "member_role_change", str(mid),
@@ -393,10 +435,11 @@ def register(app: FastAPI, *, factory: sessionmaker[Session], key_service: KeySe
         assert p.tenant_id is not None
         with factory.begin() as s:
             tenancy.set_tenant(s, p.tenant_id)
+            owners = _lock_owners(s)
             row = s.get(Membership, mid)
             if row is None:
                 raise HTTPException(404, "not found")
-            if row.role == "owner" and row.user_id is not None and _owners_left(s, mid) == 0:
+            if row.role == "owner" and row.user_id is not None and not [o for o in owners if o != mid]:
                 raise HTTPException(409, "an organisation keeps at least one owner")
             s.execute(delete(Membership).where(Membership.id == mid))
             ended = identity.end_all_sessions(s, row.user_id, p.tenant_id) if row.user_id else 0

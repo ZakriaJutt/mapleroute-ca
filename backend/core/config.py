@@ -92,6 +92,8 @@ class Settings:
     public_base_url: str
     # Console sign-in. Only the local provider is built (B2); OIDC is deferred (TRD.md AD-13).
     identity_providers: frozenset[str]
+    # Peers whose X-Forwarded-For is believed (B2-S02). Empty: uvicorn runs with proxy_headers off.
+    trusted_proxies: frozenset[str]
     # Mail: local Mailpit has no authentication; production sets a provider's host and credentials.
     smtp_host: str
     smtp_port: int
@@ -153,6 +155,9 @@ def settings() -> Settings:
         public_base_url=env.get("MAPLEROUTE_PUBLIC_BASE_URL", "http://localhost:3110"),
         identity_providers=frozenset(
             p.strip() for p in env.get("MAPLEROUTE_IDENTITY_PROVIDERS", "local").split(",") if p.strip()
+        ),
+        trusted_proxies=frozenset(
+            p.strip() for p in env.get("MAPLEROUTE_TRUSTED_PROXIES", "").split(",") if p.strip()
         ),
         smtp_host=env.get("MAPLEROUTE_SMTP_HOST", "127.0.0.1"),
         smtp_port=int(env.get("MAPLEROUTE_SMTP_PORT", "1025")),

@@ -112,6 +112,8 @@ def _check(s: Session, ks: KeyService, cred: LocalCredential | None, password: S
         passwords.verify_password(passwords.DUMMY_HASH, password)  # same work for an unknown address
         return False
     if cred.locked_until is not None and cred.locked_until > now:
+        # Same Argon2 work as the other refusals, so a locked address is not told apart by timing (B2-S03).
+        passwords.verify_password(cred.password_hash, password)
         return False
     password_ok = passwords.verify_password(cred.password_hash, password)
     seed = decrypt_with_context(ks, _seed_context(cred.user_id), cred.totp_ciphertext, cred.totp_wrapped_key)

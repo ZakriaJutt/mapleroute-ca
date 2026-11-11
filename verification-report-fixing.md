@@ -266,6 +266,22 @@ Branch `feat/b2-local-auth`, created from `feat/b1-foundation` at `40a8e2b` (pus
 
 **Blocked or not run.** OIDC (needs registered applications); real SMTP provider and S3 in `ca-central-1` (accounts); report generation (T-5.1.x); IT-06 bucket and restored-backup parts (no generated report content and no backup); UI screens S-01, S-02, S-13, S-15.
 
+### B2 security review round 1: security fixes after B2 review, awaiting recheck (2026-11-11)
+
+Reviewer's round-1 report `_coordination/review/mapleroute-ca-b2-sec-round1.md` (retest of `9a5ea82`): blocker 1, minor 4. Attack script `mapleroute-ca-b2-sec_attack.py`, unchanged, run from `backend/` before the fixes: **17 passed, 4 failed** (A06b, A15, A17, A19; the reviewer counts A11b as an observation, hence "16 of 20"). After the fixes: **21 passed, 0 failed**. Findings `B2-S0n` are the reviewer's; verdicts are the reviewer's to set.
+
+| Finding | Fix | Regression test(s) (`backend/tests/test_b2_security.py`) | Status |
+|---|---|---|---|
+| B2-S01 (blocker) logout and logout-all failed with 500 for tenant sessions; the session stayed alive | `console/auth.py`: the session delete commits in its own transaction; the audit event is written afterwards by `audit_after`, which sets tenant context, retries once and only logs `audit_failed` if both attempts fail, so it can never undo a sign-out | `test_b2_s01_logout_ends_a_tenant_session`, `test_b2_s01_logout_all_ends_every_tenant_session`, `test_b2_s01_logout_of_operator_session`, `test_b2_s01_audit_failure_never_keeps_a_session` (audit insert revoked: logout still 204, row gone) | Fixed, awaiting recheck |
+| B2-S02 forwarding headers trusted by uvicorn's default | `MAPLEROUTE_TRUSTED_PROXIES` (default empty). `console/main.py` `server_config`: `proxy_headers` off unless proxies are configured, then `forwarded_allow_ips` pinned to them. `console.auth.client_key`: with no trusted proxy, any request carrying `Forwarded`, `X-Forwarded-For` or `X-Real-IP` shares one rate-limit window, so rotating the header buys nothing even under a server that rewrites the client; the wrong comment is replaced | `test_b2_s02_server_config_does_not_trust_proxy_headers_by_default`, `test_b2_s02_rotating_forwarded_for_does_not_bypass_the_address_limit` (live uvicorn with `server_config`), `test_b2_s02_header_rewriting_server_still_shares_one_window` | Fixed, awaiting recheck |
+| B2-S03 locked account answered faster | `core/local_idp.py`: the locked branch runs the same Argon2 verification before refusing | `test_b2_s03_locked_unknown_and_wrong_password_take_the_same_work` (medians within a factor of two; one answer) | Fixed, awaiting recheck |
+| B2-S04 concurrent mutual demotion left no owner | Role change and member removal first lock every owner row of the tenant (`SELECT ... FOR UPDATE`, ordered by ID), then read the target and count the remaining owners | `test_b2_s04_concurrent_mutual_demotion_leaves_an_owner` (4 concurrent rounds) | Fixed, awaiting recheck |
+| B2-S05 claimed controls without a failing test | Tests added for each named ID | `test_b2_s05_684_…` (6.8.4: fresh `auth_time` with `amr={pwd}` refused), `test_b2_s05_724_…` (7.2.4 at re-authentication: old cookie refused), the S01 tests (7.4.1 for tenant sessions), `test_b2_s05_345_346_…` (Referrer-Policy, CSP `frame-ancestors`, `object-src`, `base-uri`), `test_b2_s05_628_…` (case, trimming, truncation refused), `test_b2_s05_629_…` (64, 100, 128 characters accepted; 129 refused), `test_b2_s05_632_…` (no account rows in migrations; common default credentials refused) | Fixed, awaiting recheck |
+
+Observation (b) also fixed: two concurrent enrolment completions for one address now return 400, not 500. Observations (a), (c), (d), (e) unchanged (product decision, local key, accepted lockout risk, unbounded windows). Against the code before the fixes, 6 of the new tests fail (the four S01 tests, S03, S04); the S02 live test depends on `server_config` and the S05 tests guard controls that already worked.
+
+**Commands after the fixes** (from `mapleroute-ca/`, clean test database): `make test`: **143 passed, 0 failed** (128 plus 15 new); `make lint`: all checks passed; `make typecheck` (mypy strict): no issues in 63 files; `make check-imports`: OK; `make orm-parity`: OK; `make smoke`: three services ok. Reviewer's attack script: 21 passed, 0 failed.
+
 ## 3. Traceability of must-haves
 
 | MH | Screen or API | Decision | Schema or permission | Tasks | Planned tests |

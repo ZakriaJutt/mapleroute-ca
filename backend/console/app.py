@@ -69,6 +69,7 @@ class ConsoleServices:
     store: ObjectStore = field(default_factory=MemoryObjectStore)
     public_base_url: str = "https://console.mapleroute.localhost"
     limits: SignInLimits = field(default_factory=SignInLimits)
+    trusted_proxies: frozenset[str] = frozenset()  # peers whose forwarding headers are believed (B2-S02)
 
     def ops(self) -> sessionmaker[Session]:
         # Without an operator factory the console role is used, and the database refuses ops writes.
@@ -117,7 +118,8 @@ def create_app(services: ConsoleServices) -> FastAPI:
         return p
 
     register_auth(app, factory=services.factory, key_service=services.key_service, mailer=services.mailer,
-                  limits=services.limits, public_base_url=services.public_base_url, principal=principal)
+                  limits=services.limits, public_base_url=services.public_base_url, principal=principal,
+                  trusted_proxies=services.trusted_proxies)
 
     def project_or_404(s: Session, pid: uuid.UUID) -> Project:
         project = s.get(Project, pid)  # row-level security hides other tenants' rows
