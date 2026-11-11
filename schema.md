@@ -117,6 +117,7 @@ erDiagram
 | | `last_verified_at`, `last_checked_at` | timestamptz | yes | request path requires `last_verified_at` within the validity period: 24 hours for `aws`, 1 hour for `azure` |
 | | `l2_confirmed_at` | timestamptz | yes | `status = 'verified'` requires it not null (check) |
 | | `provider_modified_at` | timestamptz | yes | Azure deployment's last-modified time at the last matching check |
+| | `state_observed_at` | timestamptz | yes | Start of the provider reads of the result behind the current status (B1 fix round 2, B1-012); a result changes the binding only if it observed later |
 | `verification` T | `binding_id` | uuid | no | append-only |
 | | `route_id` | text | no | references `route`; the route compared at this check (added in B1 so the resume rule reads matches per route) |
 | | `checked_at` | timestamptz | no | — |
@@ -211,6 +212,8 @@ Check: `state <> 'rejected'` requires `route_id` and `allowlist_version`. Allowe
 - `tenants_bound_to_route(route)`: tenant IDs only, for suspension alerts and the 7-day removal rule. Executable by the worker and operator.
 - `route_resume_guard()`: the trigger on `route`. Refuses `suspended` → `active` unless the session user is the operator role **and** a `verification` row with `result = 'match'` newer than the suspension exists for that route.
 
+**`job` row-level security (fix round 2, B1-005 part).** `job` is FORCE ROW LEVEL SECURITY: the worker sees all rows; the console may insert and see only `verify_binding` jobs for its own tenant; the operator only tenant-less `notify_route_suspended` jobs. A tenant session cannot queue work or alerts for another tenant.
+
 `verification` carries a composite foreign key (`tenant_id`, `binding_id`, `route_id`) to `binding` (`tenant_id`, `id`, `route_id`), so a check can only be recorded against its binding's route.
 
 Application roles map to rights as in [PRD.md](PRD.md#users-and-roles) and are enforced in `core.authz`, with row-level security as the second barrier. **Cross-tenant denial:** a query without `app.tenant_id` returns no rows; a foreign ID returns 404; `mr_gateway` cannot list tenants.
@@ -229,9 +232,9 @@ Application roles map to rights as in [PRD.md](PRD.md#users-and-roles) and are e
 | Request decision | Insert `request_log` in its own committed transaction before forwarding | One row per request ID |
 | Completion | Single update with `where state = 'forwarding'` | Second writer changes nothing |
 | Publish allow-list | One transaction: validate, set previous `superseded`, set new `active`, write `allowlist_route`, audit | Partial unique index refuses two active |
-| Verify binding (`match`) | Under the binding lock, update that binding only if `checked_at` (end of the reads) is later than `last_checked_at`; `last_verified_at` is the start of the reads | Older match recorded, never applied (R-01) |
+| Verify binding (`match`) | Under the binding lock, update that binding only if the check's observation (start of its reads) is later than `state_observed_at`; `last_verified_at` and `state_observed_at` become that observation | A match that observed earlier is recorded, never applied, however late it finishes (R-01, B1-012) |
 | Suspend route (`definition_mismatch`) | Update `where global_status = 'active'`, however late the result | Suspending is never unsafe; only resume is guarded |
-| Un-verify binding (`config_mismatch`) | Under the binding lock, always set `unverified`; flag every served request of the binding since `last_verified_at` (the start of the last matching check's reads), with no upper bound | Never discarded as late (B1-003); flagging is idempotent |
+| Un-verify binding (`config_mismatch`) | Under the binding lock, set `unverified` whenever the mismatch observed at or after the observation that verified the binding; flag every served request since the latest matching observation before it, with no upper bound. A mismatch observed before a newer verifying match leaves the status but still flags | Never discarded as late (B1-003, B1-012); flagging is idempotent |
 | Console mutations | Transaction plus `form_token` | Second submit returns first result |
 | Jobs | Unique (`kind`, `dedupe_key`) | Re-enqueue is a no-op |
 | Reconciliation | Upsert on `provider_event_id` | Replay-safe |

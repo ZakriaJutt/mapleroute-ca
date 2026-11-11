@@ -139,6 +139,35 @@ Independent code review `mapleroute-ca-b1-round1.md`: 0 blocker, 6 major, 5 mino
 - A10 stops at `permission denied for function tenants_bound_to_route`: the gateway role is no longer allowed to call it. Its assertions on `resolve_api_key` still hold.
 - A9 wires the gateway to `world.app`, which in the test harness is now the worker role. The worker cannot call `resolve_api_key`, so the request is refused before it reaches the adapter. It also asserts HTTP 500, but the error contract answers `upstream_error` 502. A copy of the script kept outside the repository, with only those two lines changed (the gateway's session factory, and 502), passes A9: no canary in the response, the uvicorn error log or the row (`upstream_error`). The in-repo test `test_b1_006_*` covers the same case.
 
+### B1 fix round 2 (2026-11-11)
+
+**Reviewer's round-2 verdicts** (copied unchanged from `mapleroute-ca-b1-verdicts.json`, retest of commit `77e32cb`; adversarial 19 passed, 2 failed: N3, N4):
+
+| ID | Verdict | Open part (reviewer) |
+|---|---|---|
+| B1-001 | Closed | — |
+| B1-002 | Closed | — |
+| B1-003 | Closed, part open | ordering by end of reads lets an older observation's match undo a newer mismatch; raised as B1-012 |
+| B1-004 | Closed | — |
+| B1-005 | Closed, part open | job table has no RLS; console may insert any job kind for any tenant (N4: false route_suspended alert to another tenant) |
+| B1-006 | Closed | — |
+| B1-007 | Closed, part open | a Decision hand-built with the private eligibility._SEAL is sealed for any host |
+| B1-008 | Closed | — |
+| B1-009 | Closed | recheck when real adapters land |
+| B1-010 | Closed | — |
+| B1-011 | Closed | — |
+| B1-012 (new, major) | Open | Concurrent checks: a match whose reads started before a newer applied mismatch re-verifies the binding; Global deployment served until next check |
+
+**This round's edits (author; fixed after retest, not re-reviewed):**
+
+| Finding | Fix | Regression test(s) | Status |
+|---|---|---|---|
+| B1-012 (and B1-003 open part) | Migration `0004` adds `binding.state_observed_at`. Each check's observation is the start of its reads; under the binding lock a `match` is applied only if it observed later than the result behind the current status; a mismatch observed at or after the verifying observation always un-verifies; a `definition_mismatch` records its observation and always suspends; an older mismatch still flags its window | `test_b1_012_older_observation_match_cannot_undo_a_newer_mismatch` (N3), `test_b1_012_three_concurrent_checks_any_finish_order`, `test_b1_012_older_mismatch_still_flags_its_window` | Fixed after retest |
+| B1-005 open part | `job` is FORCE ROW LEVEL SECURITY: console inserts and sees only its own tenant's `verify_binding` jobs, operator only tenant-less `notify_route_suspended` jobs, worker all | `test_b1_005_console_cannot_queue_jobs_for_other_tenants_or_kinds` (N4) | Fixed after retest |
+| B1-007 open part | `evaluate` issues each Decision into a module-private identity registry plus a field MAC; `is_sealed` requires that exact object. A hand-built Decision, with any `_seal` value (including the old `_SEAL`, which now grants nothing), a copy or a field change is unsealed. Residual risk, recorded: code in the same process that deliberately writes to the module's private registry can still forge one; Python offers no stronger in-process boundary | `test_b1_007_hand_built_decision_with_private_seal_is_not_sealed`, `test_b1_007_replace_on_a_sealed_decision_unseals_it` | Fixed after retest, residual risk recorded |
+
+**Commands after round 2** (from `mapleroute-ca/`): `make check` (ruff: all checks passed; mypy strict: no issues in 49 files; `import boundaries: OK`; `make test` on a re-migrated `mapleroute_test`: **101 passed, 0 failed**; `orm parity: OK`); `make smoke`: three services ok, exit 0. Reviewer's round-2 adversarial script, unchanged: **19 passed, 0 failed** (A1–A10 including A7 for each of four roles, N1–N5).
+
 ## 3. Traceability of must-haves
 
 | MH | Screen or API | Decision | Schema or permission | Tasks | Planned tests |
