@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -49,8 +50,24 @@ def role_engines():  # type: ignore[no-untyped-def]
 
 
 class Clock:
-    def __init__(self, start: datetime) -> None:
+    """Fake clock. Every change is also written to ``clock_override``, so the database clock
+    ``app_now()`` (lease times, validity, received_at) follows the same fake time (fix round 4)."""
+
+    def __init__(self, start: datetime, engine: Any = None) -> None:
+        self._engine = engine
         self.t = start
+
+    @property
+    def t(self) -> datetime:
+        return self._t
+
+    @t.setter
+    def t(self, value: datetime) -> None:
+        self._t = value
+        if self._engine is not None:
+            with self._engine.begin() as conn:
+                conn.execute(text("INSERT INTO clock_override (id, at) VALUES (true, :t) "
+                                  "ON CONFLICT (id) DO UPDATE SET at = EXCLUDED.at"), {"t": value})
 
     def __call__(self) -> datetime:
         return self.t
@@ -61,11 +78,13 @@ class Clock:
 
 
 @pytest.fixture()
-def fake_clock() -> Iterator[Clock]:
-    c = Clock(datetime(2026, 11, 11, 10, 0, tzinfo=UTC))
+def fake_clock(owner_engine) -> Iterator[Clock]:  # type: ignore[no-untyped-def]
+    c = Clock(datetime(2026, 11, 11, 10, 0, tzinfo=UTC), owner_engine)
     clock.set_clock(c)
     yield c
     clock.reset_clock()
+    with owner_engine.begin() as conn:
+        conn.execute(text("DELETE FROM clock_override"))
 
 
 @pytest.fixture()

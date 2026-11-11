@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import threading
 import uuid
+from collections.abc import Iterator
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -22,7 +23,7 @@ import pytest
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.exc import DBAPIError
 
-from core import jobs, locks
+from core import clock, jobs, locks
 from core.config import CHECK_LEASE
 from core.models import Binding, BindingCheckLease, Job, RequestLog, Verification
 from core.providers import AzureTarget, DeploymentAnswer
@@ -245,14 +246,19 @@ def test_worker_dies_mid_check_lease_expires_then_checks_resume(world: World) ->
         assert locks.holds_check(s, dead) is False
 
 
-# ------------------------------------------------------------------------- rule 2 directly
-def _apply(world: World, t: T, b: uuid.UUID, outcome: CheckOutcome, started: datetime, checked: datetime,
-           holds: bool) -> Applied:
+# ------------------------------------------------------------------------- rule 2 directly (generation)
+def _apply(world: World, t: T, b: uuid.UUID, outcome: CheckOutcome, checked: datetime,
+           lease: locks.CheckLease | None, started: datetime | None = None) -> Applied:
     with world.app.begin() as s:
         s.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": str(t.tenant_id)})
         row = s.execute(select(Binding).where(Binding.id == b).with_for_update()).scalar_one()
-        return apply_outcome(s, row, outcome, checked, "2026.11.10-1", world.pager, reads_started_at=started,
-                             holds_lease=holds, recorded_at=checked)
+        return apply_outcome(s, row, outcome, checked, "2026.11.10-1", world.pager, lease=lease,
+                             started_at=started)
+
+
+def _claim(world: World, t: T, b: uuid.UUID) -> locks.CheckLease | None:
+    with world.app() as s:
+        return locks.claim_check(s, t.tenant_id, b)
 
 
 def test_mismatch_older_than_the_verifying_match_still_unverifies_and_flags(world: World) -> None:
@@ -263,30 +269,156 @@ def test_mismatch_older_than_the_verifying_match_still_unverifies_and_flags(worl
     started_old = world.clock()
     world.clock.advance(minutes=10)
     assert check(world, t, b).result == "match"  # 10:15 verifies
-    late = _apply(world, t, b, CheckOutcome("config_mismatch", ("sku_not_eligible",)), started_old,
-                  world.clock() + timedelta(seconds=30), holds=False)
+    late = _apply(world, t, b, CheckOutcome("config_mismatch", ("sku_not_eligible",)),
+                  world.clock() + timedelta(seconds=30), lease=None, started=started_old)
     assert late.applied and late.flagged_requests == 1
     assert binding_row(world, b).status == "unverified"
     assert flags(world) == [["config_changed_window"]]
 
 
-def test_match_must_start_after_the_latest_recorded_mismatch(world: World) -> None:
+def test_match_verifies_only_if_no_mismatch_since_its_lease_was_claimed(world: World) -> None:
+    """Generation compare-and-set: a lease claimed before a mismatch cannot verify after it, even
+    though it still holds its token; a lease claimed after the mismatch can."""
     t, b = azure_setup(world)
     world.clock.advance(minutes=15)
-    recorded = world.clock()
-    assert _apply(world, t, b, CheckOutcome("config_mismatch", ("sku_not_eligible",)), recorded,
-                  recorded, holds=True).applied
-    assert binding_row(world, b).last_mismatch_at == recorded
-    for started in (recorded - timedelta(seconds=1), recorded):  # before or at the fence: refused
-        late = _apply(world, t, b, CheckOutcome("match"), started, recorded + timedelta(seconds=5), holds=True)
-        assert late.applied is False
-    lost = _apply(world, t, b, CheckOutcome("match"), recorded + timedelta(seconds=1),
-                  recorded + timedelta(seconds=5), holds=False)
-    assert lost.applied is False  # a check that lost its lease never re-verifies
+    g0 = binding_row(world, b).check_generation
+    before = _claim(world, t, b)
+    assert before is not None and before.generation == g0
+    mismatch = _apply(world, t, b, CheckOutcome("config_mismatch", ("sku_not_eligible",)), world.clock(), None)
+    assert mismatch.applied and binding_row(world, b).check_generation == g0 + 1
+    stale = _apply(world, t, b, CheckOutcome("match"), world.clock(), before)
+    assert stale.applied is False and binding_row(world, b).status == "unverified"
+    assert lease_rows(world) == 0  # it still held its token, so it released the lease
+    after = _claim(world, t, b)
+    assert after is not None and after.generation == g0 + 1
+    fresh = _apply(world, t, b, CheckOutcome("match"), world.clock(), after)
+    assert fresh.applied and binding_row(world, b).status == "verified"
+    assert binding_row(world, b).check_generation == g0 + 1  # a match never moves the generation
+
+
+def test_lease_token_reused_after_expiry_never_verifies(world: World) -> None:
+    """A check's lease expires and is taken over. Its token, presented later (after the new holder
+    finished, and again while a third check holds the lease), never verifies and releases nothing."""
+    t, b = azure_setup(world)
+    world.clock.advance(minutes=15)
+    old = _claim(world, t, b)
+    assert old is not None
+    mismatch = _apply(world, t, b, CheckOutcome("config_mismatch", ("sku_not_eligible",)), world.clock(), None)
+    assert mismatch.applied
+    assert _claim(world, t, b) is None  # live lease: no takeover
+    world.clock.advance(seconds=PAST_LEASE.total_seconds())  # database clock past the lease
+    new = _claim(world, t, b)
+    assert new is not None and new.holder != old.holder and new.generation == old.generation + 1
+    # The expired token presented while the new holder runs: not applied, the new lease stays.
+    assert _apply(world, t, b, CheckOutcome("match"), world.clock(), old).applied is False
+    assert lease_rows(world) == 1
+    # Same generation as the old token would need is gone; forge one with the current generation:
+    forged = locks.CheckLease(b, old.holder, new.generation, old.started_at, old.expires_at)
+    assert _apply(world, t, b, CheckOutcome("match"), world.clock(), forged).applied is False
     assert binding_row(world, b).status == "unverified"
-    newer = _apply(world, t, b, CheckOutcome("match"), recorded + timedelta(seconds=1),
-                   recorded + timedelta(seconds=5), holds=True)
-    assert newer.applied and binding_row(world, b).status == "verified"
+    assert _apply(world, t, b, CheckOutcome("match"), world.clock(), new).applied  # the holder verifies
+    third = _claim(world, t, b)
+    assert third is not None
+    assert _apply(world, t, b, CheckOutcome("match"), world.clock(), forged).applied is False
+    with world.app.begin() as s:
+        s.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": str(t.tenant_id)})
+        locks.release_check(s, old)
+        assert locks.holds_check(s, third)  # the old token released nothing
+
+
+# ------------------------------------------------------------------------- L4 clock skew (reviewer, round 4)
+@pytest.fixture()
+def skew(world: World) -> Iterator[dict[int, timedelta]]:
+    """Per-thread offsets on the workers' clock (core.clock); the database clock is not skewed."""
+    offsets: dict[int, timedelta] = {}
+    clock.set_clock(lambda: world.clock() + offsets.get(threading.get_ident(), timedelta(0)))
+    yield offsets
+    clock.set_clock(world.clock)
+
+
+def _skew_race(world: World, skew: dict[int, timedelta], lag: timedelta, a_slow: timedelta) -> dict[str, Any]:
+    """Worker A (clock off by ``lag``) claims and its deployment read is slow. After ``a_slow`` of
+    database time worker B (true clock) checks. If B takes the lease it reads Standard; then the
+    deployment turns Global and A's read answers Global."""
+    t, b = azure_setup(world)
+    gw = world.gateway()
+    world.clock.advance(minutes=15)
+    reader = world.azure_reader
+    a_in, go_a = threading.Event(), threading.Event()
+    st: dict[str, Any] = {}
+    main = threading.get_ident()
+    orig_dep, orig_log = reader.get_deployment, reader.get_diagnostic_logging
+
+    def dep(target: AzureTarget) -> DeploymentAnswer:
+        if threading.get_ident() != main:
+            a_in.set()
+            go_a.wait(10)
+        return orig_dep(target)
+
+    def flip_then_release_a() -> None:
+        st["flip"] = world.clock()
+        reader.recreate(HOST, DEP, "GlobalStandard", world.clock())
+        world.clock.advance(seconds=1)
+        go_a.set()
+        th.join(10)
+        world.clock.advance(seconds=1)
+        st["mid"] = code_of(world.chat(gw, t.key, "gpt-4o"))
+
+    def logging_(target: AzureTarget):  # type: ignore[no-untyped-def]
+        if threading.get_ident() == main and "flip" not in st:  # B, after its deployment read
+            flip_then_release_a()
+        return orig_log(target)
+
+    def run_a() -> None:
+        skew[threading.get_ident()] = lag
+        st["a"] = check(world, t, b)
+
+    reader.get_deployment = dep  # type: ignore[method-assign]
+    reader.get_diagnostic_logging = logging_  # type: ignore[method-assign]
+    th = threading.Thread(target=run_a)
+    th.start()
+    assert a_in.wait(10)
+    world.clock.advance(seconds=a_slow.total_seconds())
+    st["b"] = check(world, t, b)
+    if "flip" not in st:  # B was skipped: flip anyway and let A finish
+        flip_then_release_a()
+    reader.get_deployment, reader.get_diagnostic_logging = orig_dep, orig_log  # type: ignore[method-assign]
+    world.clock.advance(seconds=5)
+    st["after"] = code_of(world.chat(gw, t.key, "gpt-4o"))
+    st["status"] = binding_row(world, b).status
+    st["leases"] = lease_rows(world)
+    return st
+
+
+def test_l4a_lagging_worker_clock_cannot_expose_its_live_lease(world: World, skew: dict[int, timedelta]) -> None:
+    """Reviewer L4a: A's clock is 90 s behind; B checks 40 s later. Lease times are the database
+    clock, so A's lease is still live: B is skipped (no overlap). A then sees Global and un-verifies."""
+    st = _skew_race(world, skew, lag=-timedelta(seconds=90), a_slow=timedelta(seconds=40))
+    assert st["b"].result == "skipped"
+    assert st["a"].result == "config_mismatch" and st["a"].applied
+    assert st["mid"] == st["after"] == "route_unverified" and st["status"] == "unverified"
+    assert st["leases"] == 0
+
+
+def test_l4b_small_skew_genuine_lease_expiry_pre_flip_match_never_re_verifies(
+        world: World, skew: dict[int, timedelta]) -> None:
+    """Reviewer L4b: 5 s skew, A's read outlives the lease. B takes over, reads Standard; Global; A
+    records the mismatch (generation + 1); B's match then fails its compare-and-set."""
+    st = _skew_race(world, skew, lag=-timedelta(seconds=5), a_slow=PAST_LEASE)
+    assert st["a"].result == "config_mismatch" and st["a"].applied
+    assert st["b"].result == "match" and st["b"].applied is False
+    assert st["mid"] == st["after"] == "route_unverified" and st["status"] == "unverified"
+
+
+def test_l4_leading_worker_clock_cannot_take_a_live_lease(world: World, skew: dict[int, timedelta]) -> None:
+    """A worker whose clock is 3 minutes ahead finds a fresh lease: skipped (the lease uses the database clock)."""
+    t, b = azure_setup(world)
+    world.clock.advance(minutes=15)
+    holder = _claim(world, t, b)
+    assert holder is not None
+    skew[threading.get_ident()] = timedelta(minutes=3)
+    assert check(world, t, b).result == "skipped"
+    assert lease_rows(world) == 1
 
 
 # ------------------------------------------------------------------------- B1-005 part (R3)

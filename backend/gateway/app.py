@@ -230,6 +230,9 @@ def create_app(services: GatewayServices) -> FastAPI:
                         # Shared binding lock: a mismatch being applied for this binding finishes first
                         # (B1-001); every row committed here is visible to its window flagging.
                         locks.binding_lock(s, project_id, ctx.alias, shared=True)
+                    # Decision time and the log row's received_at are the database clock, the same clock
+                    # the worker stamps verification and validity with (B1-012, fix round 4).
+                    ctx.received_at = locks.db_now(s)
                     found = None if pre else _load_binding_state(s, project_id, ctx.alias)
                     if pre:
                         outcome = Rejection(pre[0], allowlist_version=ctx.allowlist_version)
@@ -381,6 +384,7 @@ def create_app(services: GatewayServices) -> FastAPI:
                 tenancy.set_tenant(s, tenant_id)
                 version = policy_store.load_active(s)
                 aliases = s.execute(select(Binding.alias).where(Binding.project_id == project_id)).scalars().all()
+                ctx.received_at = locks.db_now(s)
                 usable = []
                 for alias in aliases:
                     found = _load_binding_state(s, project_id, alias)

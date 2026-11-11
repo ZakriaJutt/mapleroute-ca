@@ -15,7 +15,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from core import alerts, clock, jobs, locks, policy_store, requestlog, tenancy, verification
+from core import alerts, jobs, locks, policy_store, requestlog, tenancy, verification
 from core.allowlist import RouteKey
 from core.config import CHECK_INTERVAL, FORWARDING_SWEEP_AFTER
 from core.crypto import KeyService, decrypt_secret
@@ -37,10 +37,12 @@ def verify_binding(session: Session, services: WorkerServices, tenant_id: uuid.U
     """Claim the binding's check lease, read the provider, then lock the binding and apply
     (B1-001, B1-002, B1-003).
 
-    ``now`` is when the job started. At most one check of a binding runs at a time: if another check
-    holds the lease, this one is skipped (result ``skipped``, nothing recorded). The reads run under
-    the lease but without the binding lock; ``checked_at`` is the end of the reads; the result is
-    decided only after the binding lock is held, and the lease is released in the same transaction.
+    ``now`` (the worker's clock) takes no part in the decision: lease times, ``started_at`` and
+    ``checked_at`` are the database clock (B1-012, fix round 4). At most one check of a binding runs
+    at a time: if another check holds the lease, this one is skipped (result ``skipped``, nothing
+    recorded). The reads run under the lease but without the binding lock; ``checked_at`` is the end
+    of the reads; the result is decided only after the binding lock is held, and the lease is
+    released in the same transaction.
     """
     tenancy.set_tenant(session, tenant_id)
     binding = session.execute(select(Binding).where(Binding.id == binding_id)).scalar_one()
@@ -77,7 +79,7 @@ def verify_binding(session: Session, services: WorkerServices, tenant_id: uuid.U
         return verification.check_azure(key, target_az, services.azure_reader, binding.provider_modified_at,
                                          lookback)
 
-    lease = locks.claim_check(session, tenant_id, binding_id, clock.now())
+    lease = locks.claim_check(session, tenant_id, binding_id)
     if lease is None:  # another check of this binding is running: never overlap (B1-003)
         log_event("verification_skipped", tenant_id=tenant_id, binding_id=binding_id, route_id=route.id,
                   status="skipped")
@@ -85,9 +87,7 @@ def verify_binding(session: Session, services: WorkerServices, tenant_id: uuid.U
     try:
         # The activity look-back starts at the last check whose reads completed, never at a failed one.
         lookback = verification.lookback_start(session, binding.id) or binding.last_verified_at
-        reads_started = min(now, lease.started_at)
         outcome = verification.guarded(run)
-        checked_at = max(now, clock.now())  # coverage ends when the reads end
     except BaseException:
         locks.release_check_detached(session, tenant_id, lease)
         raise
@@ -95,12 +95,9 @@ def verify_binding(session: Session, services: WorkerServices, tenant_id: uuid.U
     binding = session.execute(
         select(Binding).where(Binding.id == binding_id).with_for_update().execution_options(populate_existing=True)
     ).scalar_one()
-    holds = locks.holds_check(session, lease)  # false if the lease expired and another check took it
+    checked_at = max(locks.db_now(session), lease.started_at)  # database clock: coverage ends when reads end
     applied = verification.apply_outcome(session, binding, outcome, checked_at, version, services.pager,
-                                         reads_started_at=reads_started, holds_lease=holds,
-                                         recorded_at=clock.now())
-    if holds:
-        locks.release_check(session, lease)
+                                         lease=lease)
     log_event("verification_applied", tenant_id=tenant_id, binding_id=binding_id, route_id=route.id,
               result=outcome.result, reason=outcome.reason, status="applied" if applied.applied else "stale")
     return applied

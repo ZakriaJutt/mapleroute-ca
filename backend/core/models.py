@@ -11,6 +11,7 @@ from typing import Any
 
 from sqlalchemy import (
     ARRAY,
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -274,8 +275,10 @@ class Binding(Base):
     last_checked_at: Mapped[datetime | None] = mapped_column(TS)
     l2_confirmed_at: Mapped[datetime | None] = mapped_column(TS)
     provider_modified_at: Mapped[datetime | None] = mapped_column(TS)
-    # When the latest mismatch was recorded. A match re-verifies only if its check started after it (B1-003).
+    # When the latest mismatch was recorded (database clock); informational since fix round 4.
     last_mismatch_at: Mapped[datetime | None] = mapped_column(TS)
+    # Incremented by every mismatch; a match verifies only by compare-and-set on it (B1-012, round 4).
+    check_generation: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     created_at: Mapped[datetime] = _created()
     __table_args__ = (
         ForeignKeyConstraint(
@@ -487,6 +490,8 @@ class BindingCheckLease(Base):
     binding_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     holder: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    # The binding's check_generation when this lease was claimed.
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
     started_at: Mapped[datetime] = mapped_column(TS, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(TS, nullable=False)
     __table_args__ = (
@@ -496,3 +501,12 @@ class BindingCheckLease(Base):
         ),
         CheckConstraint("expires_at > started_at", name="ck_check_lease_expiry"),
     )
+
+
+class ClockOverride(Base):
+    """Test seam for the database clock ``app_now()``; written only by the database owner, empty outside tests."""
+
+    __tablename__ = "clock_override"
+    id: Mapped[bool] = mapped_column(Boolean, primary_key=True, server_default=text("true"))
+    at: Mapped[datetime] = mapped_column(TS, nullable=False)
+    __table_args__ = (CheckConstraint("id", name="ck_clock_override_single"),)

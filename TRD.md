@@ -159,7 +159,7 @@ Schedule: before first use; Bedrock every 6 hours with 24-hour validity; Azure e
 | `definition_mismatch` | The provider's own definition of a shared object: a system-defined Bedrock profile whose destinations differ from the route. Bedrock only; Azure exposes no shared definition through a customer account | The **route's** `global_status` becomes `suspended`; requests get `route_suspended`; operator and all tenants bound to it are alerted | Every tenant bound to that route. Deliberate: a changed definition is wrong for all of them. A single faulty read can therefore reject traffic for all until the operator re-reads from MapleRoute's own account |
 | `access_failed`, `error` | Nothing usable | No status change; the binding ages out | One binding |
 
-Ordering of results follows two rules, not timestamps alone (B1-003, B1-012, fix round 3). **1. One check of a binding at a time.** Before its first provider read a check claims the binding's lease (table `binding_check_lease`, committed in its own transaction) and holds it until the transaction that records its result, which releases it. A second check of the same binding while the lease is held is skipped and its job is retried later; checks never overlap. A lease older than `CHECK_LEASE` (2 minutes; every provider read timeout must be well below it) is taken over, so a dead worker blocks a binding for at most that long; a worker whose lease was taken over is fenced and its `match` is never applied. **2. Asymmetric safety.** Any mismatch that arrives, whatever its timing and whether or not its check still holds the lease, un-verifies the binding (`config_mismatch`) or suspends the route (`definition_mismatch`), and moves the binding's `last_mismatch_at` to when it was recorded. A binding returns to `verified` only through a `match` whose check still holds the lease and **started** after `last_mismatch_at`. Un-verifying or suspending is never unsafe; re-verifying is what needs proof. A result is decided only while the worker holds the binding advisory lock (the gateway holds the same lock, shared, while it decides and commits a request); `checked_at` is the end of the reads, `started_at` their start. Requests are flagged from the earlier of the binding's last verification and the start of the latest match that started before the mismatch's reads, with no upper bound. The Azure activity-log look-back starts at the start of the reads of the last check whose reads completed: an `access_failed` or `error` check never moves it, so a period no check read stays open until a completed check covers it. A suspended route is resumed only by the operator **and** only when a `match` whose reads **started** after the suspension and after every later `definition_mismatch` on that route exists (F-011, B1-003). Each binding is checked independently: a failure on one never stops the checks on the others, and `access_failed`, `error`, "not yet matched" and `unknown_outcome` never count as a pass anywhere, including in the report.
+Ordering of results follows two rules, and no worker's wall clock takes part in either (B1-003, B1-012; fix rounds 3 and 4). **1. One check of a binding at a time.** Before its first provider read a check claims the binding's lease (table `binding_check_lease`, committed in its own transaction), identified by a random token, and holds it until the transaction that records its result, which releases it. A second check of the same binding while the lease is held is skipped and its job is retried later; checks never overlap. Lease times are the **database clock** (`app_now()`, the database server's `clock_timestamp()`): a lease is taken over only when that clock has passed `expires_at` (`CHECK_LEASE`, 2 minutes; every provider read timeout must be well below it), so a dead worker blocks a binding for at most that long and no worker's clock, behind or ahead, can make a live lease look expired. **2. Generation, asymmetric.** Each binding has an integer `check_generation`; the claim records it in the lease row. Any mismatch that arrives, whatever its timing and whether or not its check still holds the lease, increments the generation and un-verifies the binding (`config_mismatch`) or suspends the route (`definition_mismatch`) in the same transaction. A binding returns to `verified` only through a compare-and-set that succeeds if the binding's generation still equals the one its check recorded at the claim **and** the lease row still carries the check's token. Un-verifying or suspending is never unsafe; re-verifying is what needs proof. A trigger refuses a generation that decreases. A result is decided only while the worker holds the binding advisory lock (the gateway holds the same lock, shared, while it decides and commits a request). Validity, `started_at`, `checked_at`, `last_verified_at` and the gateway's decision time (`request_log.received_at`) are all the database clock. Requests are flagged from the earlier of the binding's last verification and the start of the latest match that started before the mismatch's reads, with no upper bound. The Azure activity-log look-back starts at the start of the reads of the last check whose reads completed: an `access_failed` or `error` check never moves it, so a period no check read stays open until a completed check covers it. A suspended route is resumed only by the operator **and** only when a `match` whose reads **started** after the suspension and after every later `definition_mismatch` on that route exists (F-011, B1-003). Each binding is checked independently: a failure on one never stops the checks on the others, and `access_failed`, `error`, "not yet matched" and `unknown_outcome` never count as a pass anywhere, including in the report.
 
 ### Residual window on Azure
 
@@ -228,7 +228,7 @@ The failure is named in [PRD.md](PRD.md#highest-consequence-failure): silent out
 | 5 | A request is served but its log row is lost | Audit-before-forward | Daily digest count against load-balancer request count | Shortfall printed as "unlogged requests" |
 | 6 | The report rounds uncertainty up | Grades fixed per line type in code; unknown outcomes and uncollected fields printed | Metric M-5 audit | — |
 | 7 | MapleRoute's own data leaves Canada (backup copy, log export, a tool added later) | Register built from API reads of actual configuration; deny cross-region copy by policy | Daily register job compares configuration with the register | Residency statement withheld while any asset lacks location evidence |
-| 9 | Two checks of one binding overlap (scheduled plus manual); a slow check reads the Global deployment after a faster one verified, and its mismatch is discarded as "older" (B1-003) | One check per binding at a time (`binding_check_lease`, lease timeout `CHECK_LEASE`); any mismatch un-verifies whatever its timing; only a match whose check started after the latest recorded mismatch and still holds the lease re-verifies | Verification rows carry `started_at` and `checked_at`; skipped checks are logged and retried | Requests since the earlier of the last verification and the last match before the mismatch are flagged `config_changed_window` |
+| 9 | Two checks of one binding overlap (scheduled plus manual, or a takeover under worker clock skew); a check that read before the change re-verifies after a mismatch was recorded (B1-003, B1-012) | One check per binding at a time (`binding_check_lease`, token, database-clock lease timeout `CHECK_LEASE`); any mismatch increments `check_generation` and un-verifies whatever its timing; a match verifies only by compare-and-set on the generation recorded at its claim while its token still holds the lease | Verification rows carry `started_at` and `checked_at`; skipped checks are logged and retried | Requests since the earlier of the last verification and the last match before the mismatch are flagged `config_changed_window` |
 
 ```mermaid
 sequenceDiagram
@@ -248,7 +248,7 @@ sequenceDiagram
   O->>D: operator publishes a new allow-list version without the route
 ```
 
-Verification check of one binding (B1-003, fix round 3):
+Verification check of one binding (B1-003, B1-012, fix rounds 3 and 4; all times are the database clock):
 
 ```mermaid
 sequenceDiagram
@@ -257,18 +257,18 @@ sequenceDiagram
   participant D as PostgreSQL
   participant P as Provider control plane
   participant G as gateway
-  W->>D: claim binding_check_lease (own transaction, commit), expires after CHECK_LEASE
+  W->>D: claim binding_check_lease: token, generation = binding.check_generation, app_now() + CHECK_LEASE (own transaction, commit)
   W2->>D: claim binding_check_lease
-  D-->>W2: held and not expired: skipped, job retried later
+  D-->>W2: held and not expired by the database clock: skipped, job retried later
   W->>P: read deployment, policy, activity, logging (started_at .. checked_at)
   P-->>W: answers
   W->>D: binding advisory lock (exclusive) and binding row lock
   Note over G,D: gateway decisions wait on the shared advisory lock
-  W->>D: lock lease row: still the holder?
+  W->>D: lock lease row: does it still carry my token?
   alt mismatch (any timing, lease held or lost)
-    W->>D: verification row, binding unverified, last_mismatch_at = now, flag window, alert
-  else match, lease held, started_at after last_mismatch_at
-    W->>D: verification row, binding verified from started_at
+    W->>D: verification row, check_generation + 1, binding unverified, flag window, alert
+  else match: compare-and-set (generation unchanged and token holds the lease)
+    W->>D: verification row, binding verified from the lease's started_at
   else match otherwise
     W->>D: verification row only (not applied)
   end

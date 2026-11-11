@@ -198,6 +198,35 @@ Reviewer's notes (unchanged): B1-007 residual risk (same-process code writing th
 
 **Commands after round 3** (from `mapleroute-ca/`): `make test` (re-migrates `mapleroute_test`): **106 passed, 0 failed**; `make orm-parity`: `orm parity: OK`; `make check-imports`: `import boundaries: OK`; `make lint` (ruff): all checks passed; `make typecheck` (mypy strict): no issues in 50 files; `make smoke`: gateway, console and worker ok, same constants hash (it changed because `CHECK_LEASE` joined the hashed constants). Reviewer's adversarial script, unchanged: **21 passed, 2 failed (N3, R2)**; R1 and R3 now pass. N3 and R2 fail by design: each starts a second and third check of the binding inside the first check's provider reads, in the same thread; under rule 1 those nested checks are skipped (`skipped`), so the assertions that expect them to run (`config_mismatch` / `match` results) cannot hold. The equivalent overlaps, now only possible after a lease expiry, are covered by `test_n3_match_of_a_check_that_lost_its_lease_never_re_verifies` and `test_r1_overlap_after_lease_expiry_mismatch_still_unverifies`. Not run: any check against real AWS or Azure.
 
+### B1 fix round 4 (2026-11-11)
+
+**Reviewer's round-4 verdicts** (copied unchanged from `mapleroute-ca-b1-verdicts.json`, retest of commit `bc5a456`; reproduced: `make test` 106 passed, orm parity OK, ruff clean, mypy strict clean (50 files), check-imports OK, smoke 3 services ok, old adversarial 21 passed, 2 failed (N3, R2: setup only, nested checks now skipped); round-4 script `mapleroute-ca-b1-round4_adversarial.py`: 15 cases, 13 passed, 2 failed: L4a, L4b):
+
+| ID | Verdict |
+|---|---|
+| B1-001 | Closed |
+| B1-002 | Closed |
+| B1-003 | Closed |
+| B1-004 | Closed |
+| B1-005 | Closed |
+| B1-006 | Closed |
+| B1-007 | Closed |
+| B1-008 | Closed |
+| B1-009 | Closed |
+| B1-010 | Closed |
+| B1-011 | Closed |
+| B1-012 | Still open: lease times and last_mismatch_at come from each worker's clock (core/locks.py claim_check, core/verification.py apply_outcome), so with clock skew between workers a pre-change match passes the fence after a recorded mismatch and re-verifies the binding; served ok on a GlobalStandard deployment with 90 s skew (L4a) and with 5 s skew plus a check past CHECK_LEASE (L4b); skew also lets a worker take a live lease (L4d); major |
+
+Reviewer's notes (unchanged): N3/R2 rewritten for the lease design (N3v2, N3v3, R2v2) pass. B1-009 to be rechecked when real adapters land. Worker crash: binding stays verified and traffic is served until the lease expires and the job retry (backoff 1, 4 min) runs, about 5 min; requests in between are flagged. Repeated skipped checks fail closed at the end of validity but raise no alert (minor, not raised).
+
+**This round's edits (author). Status: fixed after round-4 retest, awaiting recheck.** Wall clocks are removed from the safety decision (coordinator's ruling):
+
+| Finding | Fix | Regression test(s) | Status |
+|---|---|---|---|
+| B1-012 (clock skew) | Migration `0006`: `binding.check_generation` (bigint) and `binding_check_lease.generation`. The claim (one SQL statement) records a random token, the binding's generation and `app_now()`-based `started_at`/`expires_at`; takeover only when `expires_at <= app_now()`. Every mismatch increments the generation and un-verifies (or suspends) in the same transaction. A match verifies only by `UPDATE binding ... WHERE check_generation = <claimed> AND` the lease row carries its token. `last_mismatch_at` stays, informational. `started_at`, `checked_at`, `last_verified_at` and the gateway's decision time (`received_at`, validity) are taken from `app_now()`. Trigger `binding_generation_monotonic` refuses a decreasing generation. `clock_override` (owner-only) lets tests pin the database clock to the fake clock | `tests/test_check_serialisation.py`: `test_l4a_lagging_worker_clock_cannot_expose_its_live_lease`, `test_l4b_small_skew_genuine_lease_expiry_pre_flip_match_never_re_verifies`, `test_l4_leading_worker_clock_cannot_take_a_live_lease`, `test_lease_token_reused_after_expiry_never_verifies`, `test_match_verifies_only_if_no_mismatch_since_its_lease_was_claimed`; round-3 tests kept | Fixed after round-4 retest, awaiting recheck |
+
+**Commands after round 4** (from `mapleroute-ca/`): `make test` (re-migrates `mapleroute_test`): **110 passed, 0 failed**; `make lint` (ruff): all checks passed; `make typecheck` (mypy strict): no issues in 50 files; `make check-imports`: OK; `make orm-parity`: OK; `make smoke`: three services ok. Reviewer's round-4 script, unchanged: **13 passed, 2 failed (L4a, L4d)**. L4b, N3v2, N3v3, R2v2, L1, L1b, L2, L3, L3b, L4c, L6, L6b and L7 pass. L4a and L4d now fail on their premise: both expect a worker with a skewed clock to take over a live lease, and with database-clock leases that worker is skipped (L4d's assertion is literally "expected the skewed worker to overlap"). The developer's `test_l4a_…` asserts the new behaviour for the same setup: B skipped, A's mismatch un-verifies, requests rejected. Old script: 21 passed, 2 failed (N3, R2, setup only, as in round 3). Outstanding: no readiness check yet refuses a non-empty `clock_override` outside tests. Not run: real AWS or Azure.
+
 ## 3. Traceability of must-haves
 
 | MH | Screen or API | Decision | Schema or permission | Tasks | Planned tests |

@@ -8,19 +8,22 @@ One outcome per kind of mismatch (TRD.md, AD-14):
   differs. The route's global status becomes ``suspended`` for every tenant.
 - ``access_failed`` / ``error``: nothing usable. No status change; the binding ages out. Never a pass.
 
-Ordering (R-01, B1-001, B1-003, B1-012): two rules, not timestamps alone.
+Ordering (R-01, B1-001, B1-003, B1-012): two rules, and no worker wall clock in either.
 1. Serialised: at most one check of a binding runs at a time; it holds the binding's check lease
-   (``core.locks``, table ``binding_check_lease``) from before its first provider read until its
-   result is recorded. A second check is skipped. A lease past ``CHECK_LEASE`` is taken over.
-2. Asymmetric: any mismatch that arrives, whatever its timing and whether or not its check still
-   holds the lease, un-verifies the binding (``config_mismatch``) or suspends the route
-   (``definition_mismatch``), and moves the binding's ``last_mismatch_at`` to when it was recorded.
-   A binding returns to ``verified`` only through a match whose check still holds the lease and
-   STARTED after ``last_mismatch_at``.
-``checked_at`` is the end of the reads; the result is decided under the binding lock. The window
-flagged on a mismatch starts at the earlier of the last verification and the start of the latest
-match that started before the mismatch's reads, and has no upper bound. A binding is ``verified``
-only when L2 (the customer-side deny policy) was read in place at that same check.
+   (``core.locks``, table ``binding_check_lease``, identified by a token) from before its first
+   provider read until its result is recorded. A second check is skipped. Lease times are the
+   database clock; a lease is taken over only after ``CHECK_LEASE`` by that clock.
+2. Generation, asymmetric: any mismatch that arrives, whatever its timing and whether or not its
+   check still holds the lease, increments ``binding.check_generation`` and un-verifies the binding
+   (``config_mismatch``) or suspends the route (``definition_mismatch``) in the same transaction.
+   A binding returns to ``verified`` only through a compare-and-set that succeeds if the
+   generation still equals the one recorded when the check took its lease and the lease row still
+   carries the check's token.
+``checked_at`` (end of the reads) and ``started_at`` are database-clock times; the result is decided
+under the binding lock. The window flagged on a mismatch starts at the earlier of the last
+verification and the start of the latest match that started before the mismatch's reads, and has no
+upper bound. A binding is ``verified`` only when L2 (the customer-side deny policy) was read in
+place at that same check.
 """
 
 from __future__ import annotations
@@ -34,7 +37,7 @@ from typing import Any
 from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session
 
-from core import alerts, jobs
+from core import alerts, jobs, locks
 from core.allowlist import RouteEntry, RouteKey
 from core.config import CANADA, CLASSES, FAILED_CHECKS_ALERT_THRESHOLD
 from core.models import Binding, LoggingObservation, ProviderConnection, Route, Verification
@@ -179,21 +182,21 @@ class Applied:
 
 
 def apply_outcome(session: Session, binding: Binding, outcome: CheckOutcome, checked_at: datetime,
-                  allowlist_version: str, pager: alerts.Pager, *, reads_started_at: datetime | None = None,
-                  holds_lease: bool, recorded_at: datetime | None = None) -> Applied:
-    """Record the verification row and apply its effect. Caller holds the tenant context, the
-    binding advisory lock and the binding row lock (SELECT ... FOR UPDATE).
+                  allowlist_version: str, pager: alerts.Pager, *, lease: locks.CheckLease | None,
+                  started_at: datetime | None = None) -> Applied:
+    """Record the verification row and apply its effect; release ``lease`` if this check still holds
+    it. Caller holds the tenant context, the binding advisory lock and the binding row lock.
 
-    ``reads_started_at``..``checked_at`` is the interval in which the provider was read;
-    ``holds_lease`` says whether this check still holds the binding's check lease (core.locks);
-    ``recorded_at`` is when the result arrives (defaults to ``checked_at``).
+    ``lease`` is the check's lease (token and generation, database clock); ``None`` for a result
+    that is not a lease-holding check, which can never verify. ``checked_at`` is the end of the
+    reads (database clock in the worker); ``started_at`` is used only when there is no lease.
 
-    Asymmetric rule (B1-003): a mismatch always applies, whatever its timing or lease, and moves the
-    binding's mismatch fence (``last_mismatch_at``) to when it was recorded. A match applies only if
-    this check still holds the lease and started after the fence.
+    Rule (B1-012, fix round 4), no wall clock involved: a mismatch always applies and increments
+    ``binding.check_generation`` in this transaction; a match verifies only through a
+    compare-and-set that succeeds if the generation still equals the one its lease recorded and
+    the lease row still carries its token.
     """
-    started = reads_started_at or checked_at
-    recorded = max(recorded_at or checked_at, checked_at)
+    started = lease.started_at if lease is not None else (started_at or checked_at)
     answer = {**outcome.provider_answer,
               "coverage": {"reads_started_at": started.isoformat(), "reads_ended_at": checked_at.isoformat()}}
     session.add(
@@ -211,33 +214,57 @@ def apply_outcome(session: Session, binding: Binding, outcome: CheckOutcome, che
                 destination_region=outcome.logging.destination_region,
             )
         )
-    session.flush()
     if binding.last_checked_at is None or checked_at > binding.last_checked_at:
         binding.last_checked_at = checked_at
-    fence = binding.last_mismatch_at
+    session.flush()
+    holds = lease is not None and locks.holds_check(session, lease)
     connection = session.get(ProviderConnection, binding.connection_id)
-    if outcome.result == "match":
-        if not holds_lease or (fence is not None and started <= fence):
+    try:
+        return _apply_effect(session, binding, outcome, checked_at, started, pager, lease if holds else None,
+                             connection)
+    finally:
+        if holds and lease is not None:
+            locks.release_check(session, lease)
             session.flush()
-            return Applied("match", applied=False)  # recorded, never applied (R-01, B1-003)
-        binding.status = "verified"
-        # Validity and the next window start from the start of the reads (conservative).
-        binding.last_verified_at = started
-        binding.l2_confirmed_at = started
-        binding.provider_modified_at = outcome.provider_modified_at
+
+
+_VERIFY_CAS = text(
+    "UPDATE binding SET status = 'verified', last_verified_at = :s, l2_confirmed_at = :s, "
+    "provider_modified_at = :pm "
+    "WHERE id = :b AND check_generation = :g "
+    "AND EXISTS (SELECT 1 FROM binding_check_lease l WHERE l.binding_id = :b AND l.holder = :h) "
+    "RETURNING id"
+)
+
+
+def _apply_effect(session: Session, binding: Binding, outcome: CheckOutcome, checked_at: datetime,
+                  started: datetime, pager: alerts.Pager, held: locks.CheckLease | None,
+                  connection: ProviderConnection | None) -> Applied:
+    if outcome.result == "match":
+        if held is None:
+            return Applied("match", applied=False)  # recorded, never applied (R-01, B1-003, B1-012)
+        won = session.execute(_VERIFY_CAS, {"s": held.started_at, "pm": outcome.provider_modified_at,
+                                            "b": binding.id, "g": held.generation, "h": held.holder}).first()
+        session.refresh(binding)
+        if won is None:
+            return Applied("match", applied=False)  # a mismatch was recorded since this check began
         if connection is not None and connection.state != "deleted":
             connection.state, connection.last_read_ok_at = "connected", checked_at
         session.flush()
         return Applied("match", True)
     if outcome.result in ("config_mismatch", "definition_mismatch"):
-        binding.last_mismatch_at = recorded if fence is None else max(fence, recorded)
+        values: dict[str, Any] = {"check_generation": Binding.check_generation + 1,
+                                  "last_mismatch_at": func.app_now()}
+        if outcome.result == "config_mismatch":
+            values["status"] = "unverified"  # always: a mismatch is never discarded (B1-003)
+        session.execute(update(Binding).where(Binding.id == binding.id).values(**values))
+        session.refresh(binding)
     if outcome.result == "config_mismatch":
-        # Window start: the start of the latest match whose reads started before this check's reads.
+        # Window start: the earlier of the last verification and the latest match started before this one.
         starts = [t for t in (prior_match_observation(session, binding.id, started), binding.last_verified_at)
                   if t is not None]
         since = min(starts) if starts else None
-        binding.status = "unverified"  # always: a mismatch is never discarded (B1-003)
-        if holds_lease and outcome.provider_modified_at is not None:
+        if held is not None and outcome.provider_modified_at is not None:
             binding.provider_modified_at = outcome.provider_modified_at  # baseline for the next check
         session.flush()
         flagged = flag_window(session, binding, since) if since is not None else 0
